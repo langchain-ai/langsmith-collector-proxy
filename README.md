@@ -77,7 +77,7 @@ go run ./cmd/collector
 ```
 You can send sample OTLP/JSON data using curl:
 ```
-curl -X POST -H "X-API-Key: devkey" \
+curl -X POST -H "X-API-Key: lsv2..." \
      -H "Content-Type: application/json" \
      --data '{"resourceSpans":[]}' \
      http://localhost:4318/v1/traces
