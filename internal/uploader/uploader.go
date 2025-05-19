@@ -64,7 +64,11 @@ func (u *Uploader) send(ctx context.Context, b Batch) {
 	url := u.cfg.BaseURL + "/runs/multipart"
 	var attempt int
 	for {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b.Data))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b.Data))
+		if err != nil {
+			slog.Error("Failed to initialize request", "err", err)
+			return
+		}
 		req.Header.Set("Content-Type", "multipart/form-data; boundary="+b.Boundary)
 		req.Header.Set("Content-Encoding", "zstd")
 		req.Header.Set("X-API-Key", u.cfg.APIKey)
