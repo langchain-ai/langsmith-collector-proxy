@@ -19,30 +19,47 @@ type Translator struct {
 	mu         sync.RWMutex
 	span2trace map[string]spanEntry
 	ttl        time.Duration
+	stop       chan struct{}
 }
 
 func NewTranslator() *Translator {
-	return &Translator{
+	t := &Translator{
 		span2trace: make(map[string]spanEntry),
 		ttl:        5 * time.Minute,
+		stop:       make(chan struct{}),
+	}
+	if t.ttl > 0 {
+		go t.clean()
+	}
+	return t
+}
+
+func (t *Translator) clean() {
+	ticker := time.NewTicker(t.ttl / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			cutoff := time.Now().Add(-t.ttl)
+			t.mu.Lock()
+			for k, v := range t.span2trace {
+				if v.ts.Before(cutoff) {
+					delete(t.span2trace, k)
+				}
+			}
+			t.mu.Unlock()
+		case <-t.stop:
+			return
+		}
 	}
 }
 
+func (t *Translator) Close() { close(t.stop) }
+
 // Translate converts every OTLP span in the request to a Run slice.
+// Creating a new one spins up a new goroutine to clean up stale aliases.
 func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) []*model.Run {
 	total := 0
-	// gc stale aliases first
-	if t.ttl > 0 {
-		cutoff := time.Now().Add(-t.ttl)
-		t.mu.Lock()
-		for k, v := range t.span2trace {
-			if v.ts.Before(cutoff) {
-				delete(t.span2trace, k)
-			}
-		}
-		t.mu.Unlock()
-	}
-
 	// count total spans
 	for _, rs := range req.ResourceSpans {
 		for _, ss := range rs.ScopeSpans {
