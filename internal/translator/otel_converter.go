@@ -44,6 +44,8 @@ const (
 	GenAIUsageOutputTokens = "gen_ai.usage.output_tokens"
 	GenAIUsageTotalTokens  = "gen_ai.usage.total_tokens"
 	GenAIOperationName     = "gen_ai.operation.name"
+	GenAIContentPrompt     = "gen_ai.content.prompt"
+	GenAIContentCompletion = "gen_ai.content.completion"
 	// Deprecated
 	GenAIUsagePromptTokens     = "gen_ai.usage.prompt_tokens"
 	GenAIUsageCompletionTokens = "gen_ai.usage.completion_tokens"
@@ -52,10 +54,6 @@ const (
 	LangSmithTraceName      = "langsmith.trace.name"
 	LangSmithSpanKind       = "langsmith.span.kind"
 	LangSmithMetadataPrefix = "langsmith.metadata"
-	LangSmithRunID          = "langsmith.span.id"
-	LangSmithTraceID        = "langsmith.trace.id"
-	LangSmithDottedOrder    = "langsmith.span.dotted_order"
-	LangSmithParentRunID    = "langsmith.span.parent_id"
 	LangSmithSessionID      = "langsmith.trace.session_id"
 	LangSmithSessionName    = "langsmith.trace.session_name"
 	LangSmithTags           = "langsmith.span.tags"
@@ -73,17 +71,6 @@ const (
 	LogfirePrompt            = "prompt"
 	LogfireAllMessagesEvents = "all_messages_events"
 	LogfireEvents            = "events"
-
-	// GenAI event names
-	GenAIContentPrompt         = "gen_ai.content.prompt"
-	GenAIContentCompletion     = "gen_ai.content.completion"
-	GenAISystemMessageEvent    = "gen_ai.system.message"
-	GenAIUserMessageEvent      = "gen_ai.user.message"
-	GenAIAssistantMessageEvent = "gen_ai.assistant.message"
-	GenAIToolMessageEvent      = "gen_ai.tool.message"
-	GenAIChoiceEvent           = "gen_ai.choice"
-	// Microsoft Semantic Kernel specific
-	GenAIEventContent = "gen_ai.event.content"
 )
 
 var TraceLoopInvocationParams = []string{
@@ -103,652 +90,21 @@ var TraceLoopInvocationParams = []string{
 	"llm.request.functions",
 }
 
-type GenAiConverter struct{}
-
-type spanContext struct {
-	span               *tracesdkpb.Span
-	attrs              map[string]*commonpb.AnyValue
-	run                *model.Run
-	genericOtelEnabled bool
-}
-
-func (c *GenAiConverter) ConvertSpan(span *tracesdkpb.Span, genericOtelEnabled bool) (*model.Run, error) {
-	ctx := &spanContext{
-		span:               span,
-		attrs:              extractAttributes(span.Attributes),
-		genericOtelEnabled: genericOtelEnabled,
-	}
-
-	run, err := initializeRun(ctx)
-	if err != nil {
-		return nil, err
-	}
-	ctx.run = run
-
-	processSpanEvents(ctx)
-	processRunType(ctx)
-	processRunName(ctx)
-	processLangSmithAttributes(ctx)
-	processInvocationParams(ctx)
-	processSystemAndModel(ctx)
-	processPromptTemplate(ctx)
-	processRetriever(ctx)
-	processMessages(ctx)
-	processInputsOutputs(ctx)
-	processMetadata(ctx)
-	processTags(ctx)
-	processTokenUsage(ctx)
-	processErrors(ctx)
-	processGenericAttributes(ctx)
-	finalizeRunStatus(ctx)
-
-	return ctx.run, nil
-}
-
-func extractAttributes(attrs []*commonpb.KeyValue) map[string]*commonpb.AnyValue {
-	result := make(map[string]*commonpb.AnyValue)
-	for _, attr := range attrs {
-		if attr.Value != nil {
-			result[attr.Key] = attr.Value
-		}
-	}
-	return result
-}
-
-func initializeRun(ctx *spanContext) (*model.Run, error) {
-	spanID, err := idToUUID(ctx.span.GetSpanId())
-	if err != nil {
-		return nil, err
-	}
-
-	var parentID *string
-	if len(ctx.span.ParentSpanId) > 0 {
-		parsed, err := idToUUID(ctx.span.ParentSpanId)
-		if err != nil {
-			return nil, err
-		}
-		parentID = strPointer(parsed.String())
-	}
-
-	startTime := time.Unix(0, int64(ctx.span.GetStartTimeUnixNano()))
-	endTime := time.Unix(0, int64(ctx.span.GetEndTimeUnixNano()))
-
-	run := &model.Run{
-		ID:          strPointer(spanID.String()),
-		ParentRunID: parentID,
-		Name:        &ctx.span.Name,
-		StartTime:   strPointer(startTime.UTC().Format(time.RFC3339Nano)),
-		EndTime:     strPointer(endTime.UTC().Format(time.RFC3339Nano)),
-		Extra: map[string]interface{}{
-			LangSmithMetadata: map[string]interface{}{
-				OtelTraceIdKey: fmt.Sprintf("%x", ctx.span.TraceId),
-				OtelSpanIdKey:  fmt.Sprintf("%x", ctx.span.SpanId),
-			},
-		},
-	}
-
-	return run, nil
-}
-
-func processSpanEvents(ctx *spanContext) {
-	if len(ctx.span.Events) > 0 {
-		inputs, outputs := extractFromEvents(ctx.span.Events)
-		if inputs != nil && ctx.run.Inputs == nil {
-			ctx.run.Inputs = inputs
-		}
-		if outputs != nil && ctx.run.Outputs == nil {
-			ctx.run.Outputs = outputs
-		}
-	}
-}
-
-func processRunType(ctx *spanContext) {
-	runType, err := getRunType(ctx.attrs)
-	if err == nil {
-		ctx.run.RunType = runType
-	}
-}
-
-func processRunName(ctx *spanContext) {
-	nameKeys := []struct {
-		key       string
-		condition func() bool
-	}{
-		{LangSmithTraceName, func() bool { return true }},
-		{TraceLoopEntityName, func() bool { return true }},
-		{OpenInferenceToolName, func() bool {
-			return getStringValue(ctx.attrs, OpenInferenceSpanKind) == "TOOL"
-		}},
-	}
-
-	for _, nk := range nameKeys {
-		if name := getStringValue(ctx.attrs, nk.key); name != "" && nk.condition() {
-			ctx.run.Name = &name
-			return
-		}
-	}
-}
-
-func processLangSmithAttributes(ctx *spanContext) {
-	langsmithAttrs := map[string]**string{
-		LangSmithTraceID:     &ctx.run.TraceID,
-		LangSmithDottedOrder: &ctx.run.DottedOrder,
-		LangSmithSessionID:   &ctx.run.SessionID,
-		LangSmithSessionName: &ctx.run.SessionName,
-		LangSmithRunID:       &ctx.run.ID,
-		LangSmithParentRunID: &ctx.run.ParentRunID,
-	}
-
-	for key, target := range langsmithAttrs {
-		if value := getStringValue(ctx.attrs, key); value != "" {
-			*target = strPointer(value)
-		}
-	}
-}
-
-func processInvocationParams(ctx *spanContext) {
-	// Process TraceLoop invocation params
-	for _, key := range TraceLoopInvocationParams {
-		if attr, ok := ctx.attrs[key]; ok && attr.Value != nil {
-			parts := strings.Split(key, ".")
-			paramKey := parts[len(parts)-1]
-			if value := extractProtobufValue(attr.Value); value != nil {
-				ensureInvocationParams(ctx)
-				ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})[paramKey] = value
-			}
-		}
-	}
-
-	// Process Arize invocation params
-	if params := getStringValue(ctx.attrs, "llm.invocation_parameters"); params != "" {
-		var parsedParams map[string]interface{}
-		if err := json.Unmarshal([]byte(params), &parsedParams); err == nil {
-			ensureInvocationParams(ctx)
-			for key, value := range parsedParams {
-				ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})[key] = value
-			}
-		}
-	}
-
-	// Process tools
-	processTools(ctx)
-
-	// Process tool name and arguments
-	if toolName := extractProtobufValue(getAttrValue(ctx.attrs, "gen_ai.tool.name")); toolName != nil {
-		ensureInvocationParams(ctx)
-		ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_name"] = toolName
-		ctx.run.RunType = strPointer(model.RunTypeTool)
-	}
-
-	processToolArguments(ctx)
-}
-
-func processTools(ctx *spanContext) {
-	toolsAttr, ok := ctx.attrs["tools"]
-	if !ok {
-		return
-	}
-
-	switch v := toolsAttr.Value.(type) {
-	case *commonpb.AnyValue_ArrayValue:
-		toolNames := make([]interface{}, len(v.ArrayValue.Values))
-		for i, av := range v.ArrayValue.Values {
-			if av != nil {
-				toolNames[i] = extractProtobufValue(av.Value)
-			}
-		}
-		ensureInvocationParams(ctx)
-		ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tools"] = toolNames
-	case *commonpb.AnyValue_StringValue:
-		arr := make([]interface{}, 0)
-		if err := json.Unmarshal([]byte(v.StringValue), &arr); err == nil {
-			ensureInvocationParams(ctx)
-			ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tools"] = arr
-		} else {
-			ensureInvocationParams(ctx)
-			ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tools"] = []interface{}{v.StringValue}
-		}
-	}
-}
-
-func processToolArguments(ctx *spanContext) {
-	argsAttr, ok := ctx.attrs["tool_arguments"]
-	if !ok {
-		return
-	}
-
-	switch v := argsAttr.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		obj := make(map[string]interface{})
-		ensureInvocationParams(ctx)
-		if err := json.Unmarshal([]byte(v.StringValue), &obj); err == nil {
-			ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_arguments"] = obj
-		} else {
-			ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_arguments"] = v.StringValue
-		}
-	case *commonpb.AnyValue_KvlistValue:
-		kv := make(map[string]interface{})
-		for _, kvp := range v.KvlistValue.Values {
-			kv[kvp.Key] = extractProtobufValue(kvp.Value)
-		}
-		ensureInvocationParams(ctx)
-		ctx.run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_arguments"] = kv
-	}
-}
-
-func processSystemAndModel(ctx *spanContext) {
-	metadata := ctx.run.Extra[LangSmithMetadata].(map[string]interface{})
-
-	// Process system
-	systemKeys := []string{TraceLoopGenAISystem, OpenInferenceSystem}
-	for _, key := range systemKeys {
-		if system := getStringValue(ctx.attrs, key); system != "" {
-			metadata[LangSmithLSProvider] = system
-			break
-		}
-	}
-
-	// Process model
-	if modelName, ok := extractModelName(ctx.attrs); ok {
-		metadata[LangSmithModelName] = modelName
-	}
-}
-
-func processPromptTemplate(ctx *spanContext) {
-	_, inputOk := ctx.attrs["input.value"]
-	_, templateOk := ctx.attrs["llm.prompt_template.variables"]
-
-	if templateOk {
-		ctx.run.RunType = strPointer(model.RunTypePrompt)
-	}
-
-	if !inputOk || !templateOk {
-		return
-	}
-
-	inputStr := getStringValue(ctx.attrs, "input.value")
-	if inputStr == "" {
-		return
-	}
-
-	// Try to parse as JSON first
-	var inputMap map[string]interface{}
-	if err := json.Unmarshal([]byte(inputStr), &inputMap); err == nil {
-		ctx.run.Inputs = inputMap
-		return
-	}
-
-	// If not JSON, try to match against template variables
-	templateStr := getStringValue(ctx.attrs, "llm.prompt_template.variables")
-	var templateVars map[string]interface{}
-	if err := json.Unmarshal([]byte(templateStr), &templateVars); err == nil {
-		for key, val := range templateVars {
-			if strVal, ok := val.(string); ok && strVal == inputStr {
-				ctx.run.Inputs = map[string]interface{}{key: inputStr}
-				break
-			}
-		}
-	}
-}
-
-func processRetriever(ctx *spanContext) {
-	if ctx.run.RunType == nil || *ctx.run.RunType != "retriever" {
-		return
-	}
-
-	// Process input
-	if inputValue := getStringValue(ctx.attrs, "input.value"); inputValue != "" {
-		ctx.run.Inputs = map[string]interface{}{"query": inputValue}
-	}
-
-	// Process documents
-	formattedDocs := extractRetrieverDocuments(ctx.attrs)
-	if len(formattedDocs) > 0 {
-		ctx.run.Outputs = map[string]interface{}{"documents": formattedDocs}
-	}
-}
-
-func extractRetrieverDocuments(attrs map[string]*commonpb.AnyValue) []interface{} {
-	var docs []interface{}
-
-	for i := 0; ; i++ {
-		contentKey := fmt.Sprintf("retrieval.documents.%d.document.content", i)
-		metadataKey := fmt.Sprintf("retrieval.documents.%d.document.metadata", i)
-
-		content := getStringValue(attrs, contentKey)
-		metadataStr := getStringValue(attrs, metadataKey)
-
-		if content == "" || metadataStr == "" {
-			break
-		}
-
-		var metadata map[string]interface{}
-		if err := json.Unmarshal([]byte(metadataStr), &metadata); err == nil {
-			docs = append(docs, map[string]interface{}{
-				"page_content": content,
-				"metadata":     metadata,
-				"type":         "Document",
-			})
-		}
-	}
-
-	return docs
-}
-
-func processMessages(ctx *spanContext) {
-	// Process input messages
-	if ctx.run.Inputs == nil {
-		if prompts := extractMessages("gen_ai.prompt", ctx.attrs); len(prompts) > 0 {
-			ctx.run.Inputs = map[string]interface{}{"messages": prompts}
-		} else if inputMessages := extractMessages("llm.input_messages", ctx.attrs); len(inputMessages) > 0 {
-			ctx.run.Inputs = map[string]interface{}{"messages": inputMessages}
-		}
-	}
-
-	// Process completions
-	if ctx.run.Outputs == nil {
-		if completions := extractMessages("gen_ai.completion", ctx.attrs); len(completions) > 0 {
-			ctx.run.Outputs = map[string]interface{}{"messages": completions}
-		} else if completions := extractMessages("llm.output_messages", ctx.attrs); len(completions) > 0 {
-			ctx.run.Outputs = map[string]interface{}{"messages": completions}
-		}
-	}
-}
-
-func processInputsOutputs(ctx *spanContext) {
-	// Process inputs
-	inputKeys := []string{OpenInferenceInput, TraceLoopEntityInput, GenAIPrompt, LogfirePrompt}
-	if ctx.run.Inputs == nil {
-		for _, key := range inputKeys {
-			if inputStr := getStringValue(ctx.attrs, key); inputStr != "" {
-				var input map[string]interface{}
-				if err := json.Unmarshal([]byte(inputStr), &input); err == nil {
-					ctx.run.Inputs = input
-					break
-				}
-			}
-		}
-	}
-
-	// Process outputs
-	outputKeys := []string{OpenInferenceOutput, TraceLoopEntityOutput, GenAICompletion, LogfireAllMessagesEvents}
-	if ctx.run.Outputs == nil {
-		for _, key := range outputKeys {
-			if outputStr := getStringValue(ctx.attrs, key); outputStr != "" {
-				ctx.run.Outputs = parseOutput(outputStr)
-				break
-			}
-		}
-	}
-
-	// Process Logfire events
-	processLogfireEvents(ctx)
-}
-
-func parseOutput(outputStr string) map[string]interface{} {
-	var output map[string]interface{}
-	if err := json.Unmarshal([]byte(outputStr), &output); err != nil {
-		output = map[string]interface{}{"text": outputStr}
-	}
-
-	// Convert embedding arrays to []float64 if present
-	if data, ok := output["data"].([]interface{}); ok {
-		for _, item := range data {
-			if embeddingMap, ok := item.(map[string]interface{}); ok {
-				if embedding, ok := embeddingMap["embedding"].([]interface{}); ok {
-					embeddingMap["embedding"] = convertToFloat64Array(embedding)
-				}
-			}
-		}
-	}
-
-	return output
-}
-
-func processLogfireEvents(ctx *spanContext) {
-	evtAttr, ok := ctx.attrs[LogfireEvents]
-	if !ok || (ctx.run.Inputs != nil && ctx.run.Outputs != nil) {
-		return
-	}
-
-	var rawEvents []interface{}
-	switch v := evtAttr.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		_ = json.Unmarshal([]byte(v.StringValue), &rawEvents)
-	case *commonpb.AnyValue_ArrayValue:
-		rawEvents = make([]interface{}, len(v.ArrayValue.Values))
-		for i, av := range v.ArrayValue.Values {
-			rawEvents[i] = extractProtobufValue(av)
-		}
-	}
-
-	if len(rawEvents) == 0 {
-		return
-	}
-
-	var choiceEvent map[string]interface{}
-	inputEvents := make([]interface{}, 0)
-
-	for _, ev := range rawEvents {
-		if m, ok := ev.(map[string]interface{}); ok {
-			if m["event.name"] == "gen_ai.choice" {
-				choiceEvent = m
-			} else {
-				inputEvents = append(inputEvents, m)
-			}
-		}
-	}
-
-	if ctx.run.Inputs == nil && len(inputEvents) > 0 {
-		ctx.run.Inputs = map[string]interface{}{"input": inputEvents}
-	}
-	if ctx.run.Outputs == nil && choiceEvent != nil {
-		ctx.run.Outputs = choiceEvent
-	}
-}
-
-func processMetadata(ctx *spanContext) {
-	metadata := ctx.run.Extra[LangSmithMetadata].(map[string]interface{})
-
-	// Add prefixed metadata
-	addPrefixedAttributesToMetadata(ctx.attrs, TraceLoopAssociationProperties, metadata)
-	addPrefixedAttributesToMetadata(ctx.attrs, LangSmithMetadataPrefix, metadata)
-
-	// Add OpenInference metadata
-	if metadataStr := getStringValue(ctx.attrs, "metadata"); metadataStr != "" {
-		var parsedMetadata map[string]interface{}
-		if err := json.Unmarshal([]byte(metadataStr), &parsedMetadata); err == nil {
-			for key, value := range parsedMetadata {
-				metadata[key] = value
-			}
-		}
-	}
-}
-
-func processTags(ctx *spanContext) {
-	if tagsStr := getStringValue(ctx.attrs, LangSmithTags); tagsStr != "" {
-		tags := strings.Split(tagsStr, ",")
-		for i, tag := range tags {
-			tags[i] = strings.TrimSpace(tag)
-		}
-		ctx.run.Tags = tags
-	}
-}
-
-func processTokenUsage(ctx *spanContext) {
-	if ctx.run.Outputs == nil {
-		return
-	}
-
-	usageMetadata := map[string]interface{}{}
-
-	// Input tokens
-	inputTokenKeys := []string{GenAIUsagePromptTokens, GenAIUsageInputTokens, "llm.token_count.prompt"}
-	for _, key := range inputTokenKeys {
-		if tokens := getIntValue(ctx.attrs, key); tokens != nil {
-			usageMetadata["input_tokens"] = *tokens
-			break
-		}
-	}
-
-	// Output tokens
-	outputTokenKeys := []string{GenAIUsageCompletionTokens, GenAIUsageOutputTokens, "llm.token_count.completion"}
-	for _, key := range outputTokenKeys {
-		if tokens := getIntValue(ctx.attrs, key); tokens != nil {
-			usageMetadata["output_tokens"] = *tokens
-			break
-		}
-	}
-
-	// Total tokens
-	totalTokenKeys := []string{GenAIUsageTotalTokens, "llm.usage.total_tokens", "llm.token_count.total"}
-	for _, key := range totalTokenKeys {
-		if tokens := getIntValue(ctx.attrs, key); tokens != nil {
-			usageMetadata["total_tokens"] = *tokens
-			break
-		}
-	}
-
-	if len(usageMetadata) > 0 {
-		ctx.run.Outputs["usage_metadata"] = usageMetadata
-	}
-}
-
-func processErrors(ctx *spanContext) {
-	for _, event := range ctx.span.Events {
-		if event.Name == "exception" {
-			ctx.run.Status = strPointer("error")
-
-			for _, attr := range event.Attributes {
-				switch attr.Key {
-				case "exception.message":
-					if msg := getStringValueFromAttr(attr); msg != "" {
-						ctx.run.Error = strPointer(msg)
-					}
-				case "exception.stacktrace":
-					if stacktrace := getStringValueFromAttr(attr); stacktrace != "" {
-						if ctx.run.Error != nil {
-							*ctx.run.Error += "\n\nStacktrace:\n" + stacktrace
-						} else {
-							ctx.run.Error = strPointer("Stacktrace:\n" + stacktrace)
-						}
-					}
-				}
-			}
-			break
-		}
-	}
-}
-
-func processGenericAttributes(ctx *spanContext) {
-	if !ctx.genericOtelEnabled {
-		return
-	}
-
-	metadata := ctx.run.Extra[LangSmithMetadata].(map[string]interface{})
-
-	skipPrefixes := []string{
-		TraceLoopAssociationProperties,
-		"gen_ai.",
-		"llm.",
-		"langsmith.",
-	}
-
-	skipKeys := map[string]bool{
-		TraceLoopEntityInput:  true,
-		OpenInferenceInput:    true,
-		TraceLoopEntityOutput: true,
-		OpenInferenceOutput:   true,
-		TraceLoopEntityName:   true,
-		TraceLoopSpanKind:     true,
-		OpenInferenceSpanKind: true,
-	}
-
-	for key, attr := range ctx.attrs {
-		skip := false
-
-		for _, prefix := range skipPrefixes {
-			if strings.HasPrefix(key, prefix) {
-				skip = true
-				break
-			}
-		}
-
-		if skip || skipKeys[key] {
-			continue
-		}
-
-		if value := extractProtobufValue(attr.Value); value != nil {
-			metadata[key] = value
-		}
-	}
-}
-
-func finalizeRunStatus(ctx *spanContext) {
-	if ctx.run.Status == nil || *ctx.run.Status != "error" {
-		ctx.run.Status = strPointer("success")
-	}
-}
-
-// Helper functions
-
-func ensureInvocationParams(ctx *spanContext) {
-	if _, ok := ctx.run.Extra[LangSmithInvocationParams]; !ok {
-		ctx.run.Extra[LangSmithInvocationParams] = make(map[string]interface{})
-	}
-}
-
-func getStringValue(attrs map[string]*commonpb.AnyValue, key string) string {
-	if attr, ok := attrs[key]; ok {
-		if v, ok := attr.Value.(*commonpb.AnyValue_StringValue); ok {
-			return v.StringValue
-		}
-	}
-	return ""
-}
-
-func getIntValue(attrs map[string]*commonpb.AnyValue, key string) *int64 {
-	if attr, ok := attrs[key]; ok {
-		if v, ok := attr.Value.(*commonpb.AnyValue_IntValue); ok {
-			return &v.IntValue
-		}
-	}
-	return nil
-}
-
-func getAttrValue(attrs map[string]*commonpb.AnyValue, key string) interface{} {
-	if attr, ok := attrs[key]; ok {
-		return attr.Value
-	}
-	return nil
-}
-
-func getStringValueFromAttr(attr *commonpb.KeyValue) string {
-	if attr.Value != nil {
-		if v, ok := attr.Value.Value.(*commonpb.AnyValue_StringValue); ok {
-			return v.StringValue
-		}
-	}
-	return ""
+func strPointer(s string) *string {
+	return &s
 }
 
 func idToUUID(id []byte) (uuid.UUID, error) {
 	if len(id) < 8 {
 		return uuid.Nil, fmt.Errorf("invalid id length: expected >= 8 bytes, got %d", len(id))
 	}
-	uuidBytes := make([]byte, 16)
-	// Fill with zeros first
-	for i := range uuidBytes {
-		uuidBytes[i] = 0
+	var buf [16]byte
+	if len(id) > 16 {
+		id = id[len(id)-16:]
 	}
-	// Copy the input bytes, up to 16 bytes
-	copyLen := len(id)
-	if copyLen > 16 {
-		copyLen = 16
-	}
-	copy(uuidBytes[16-copyLen:], id[len(id)-copyLen:])
+	copy(buf[16-len(id):], id)
 
-	result, err := uuid.FromBytes(uuidBytes)
+	result, err := uuid.FromBytes(buf[:])
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -756,9 +112,6 @@ func idToUUID(id []byte) (uuid.UUID, error) {
 }
 
 func extractProtobufValue(value interface{}) interface{} {
-	if value == nil {
-		return nil
-	}
 	switch v := value.(type) {
 	case *commonpb.AnyValue_StringValue:
 		return v.StringValue
@@ -779,6 +132,9 @@ func extractProtobufValue(value interface{}) interface{} {
 	}
 }
 
+type GenAiConverter struct{}
+
+// Helper function to add prefixed attributes to metadata
 func addPrefixedAttributesToMetadata(spanAttrs map[string]*commonpb.AnyValue, prefix string, metadata map[string]interface{}) {
 	for key, attr := range spanAttrs {
 		if strings.HasPrefix(key, prefix+".") {
@@ -790,6 +146,7 @@ func addPrefixedAttributesToMetadata(spanAttrs map[string]*commonpb.AnyValue, pr
 	}
 }
 
+// Helper function to convert []interface{} to []float64 for embeddings
 func convertToFloat64Array(input []interface{}) []float64 {
 	result := make([]float64, len(input))
 	for i, v := range input {
@@ -803,12 +160,14 @@ func convertToFloat64Array(input []interface{}) []float64 {
 	return result
 }
 
+// extractModelName looks for a model‑name attribute in order of precedence and
+// returns it if found.
 func extractModelName(attrs map[string]*commonpb.AnyValue) (string, bool) {
 	keys := []string{
-		TraceLoopGenAIRequestModel,
-		TraceLoopGenAIResponseModel,
-		"model",
-		OpenInferenceModelName,
+		TraceLoopGenAIRequestModel,  // "gen_ai.request.model"
+		TraceLoopGenAIResponseModel, // "gen_ai.response.model"
+		"model",                     // some SDKs use a bare "model"
+		OpenInferenceModelName,      // "llm.model_name"
 	}
 	for _, k := range keys {
 		if v, ok := attrs[k]; ok && v != nil {
@@ -820,6 +179,522 @@ func extractModelName(attrs map[string]*commonpb.AnyValue) (string, bool) {
 	return "", false
 }
 
+func (c *GenAiConverter) ConvertSpan(span *tracesdkpb.Span, genericOtelEnabled bool) (*model.Run, error) {
+	// Convert timestamps from nanoseconds to time.Time
+	startTime := time.Unix(0, int64(span.GetStartTimeUnixNano()))
+	endTime := time.Unix(0, int64(span.GetEndTimeUnixNano()))
+
+	// Convert trace_id and span_id to UUIDs
+	spanID, err := idToUUID(span.GetSpanId())
+	if err != nil {
+		return nil, err
+	}
+	traceID, err := idToUUID(span.GetTraceId())
+	if err != nil {
+		return nil, err
+	}
+
+	var parentID *string
+	if len(span.ParentSpanId) > 0 {
+		parsed, err := idToUUID(span.ParentSpanId)
+		if err != nil {
+			return nil, err
+		}
+		parentID = strPointer(parsed.String())
+	}
+	// Initialize run fields
+	run := &model.Run{
+		ID:          strPointer(spanID.String()),
+		ParentRunID: parentID,
+		TraceID:     strPointer(traceID.String()),
+		Name:        &span.Name,
+		StartTime:   strPointer(startTime.UTC().Format(time.RFC3339Nano)),
+		EndTime:     strPointer(endTime.UTC().Format(time.RFC3339Nano)),
+		Extra: map[string]interface{}{
+			LangSmithMetadata: map[string]interface{}{},
+		},
+		Inputs:  nil,
+		Outputs: nil,
+	}
+
+	run.Extra[LangSmithMetadata].(map[string]interface{})[OtelTraceIdKey] = fmt.Sprintf("%x", span.TraceId)
+	run.Extra[LangSmithMetadata].(map[string]interface{})[OtelSpanIdKey] = fmt.Sprintf("%x", span.SpanId)
+
+	// Convert attributes to a map for easier access
+	spanAttrs := make(map[string]*commonpb.AnyValue)
+	for _, attr := range span.Attributes {
+		if attr.Value != nil {
+			spanAttrs[attr.Key] = attr.Value
+		}
+	}
+
+	if len(span.Events) > 0 {
+		inputs, outputs := extractFromEvents(span.Events)
+		if inputs != nil && run.Inputs == nil {
+			run.Inputs = inputs
+		}
+		if outputs != nil && run.Outputs == nil {
+			run.Outputs = outputs
+		}
+	}
+
+	runType, err := getRunType(spanAttrs)
+	if err != nil {
+		return nil, err
+	} else {
+		run.RunType = runType
+	}
+	if entityName, ok := spanAttrs[LangSmithTraceName]; ok {
+		if stringValue, ok := entityName.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.Name = &stringValue.StringValue
+		}
+	} else if entityName, ok := spanAttrs[TraceLoopEntityName]; ok {
+		// Override run.name with traceloop.entity.name which is more specific
+		if stringValue, ok := entityName.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.Name = &stringValue.StringValue
+		}
+	} else if toolName, ok := spanAttrs[OpenInferenceToolName]; ok &&
+		spanAttrs[OpenInferenceSpanKind] != nil &&
+		spanAttrs[OpenInferenceSpanKind].Value.(*commonpb.AnyValue_StringValue).StringValue == "TOOL" {
+		if stringValue, ok := toolName.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.Name = &stringValue.StringValue
+		}
+	}
+
+	if sessionID, ok := spanAttrs[LangSmithSessionID]; ok {
+		if stringValue, ok := sessionID.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.SessionID = strPointer(stringValue.StringValue)
+		}
+	}
+
+	if sessionName, ok := spanAttrs[LangSmithSessionName]; ok {
+		if stringValue, ok := sessionName.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.SessionName = strPointer(stringValue.StringValue)
+		}
+	}
+
+	// invocation params
+	for _, modelAttrKey := range TraceLoopInvocationParams {
+		if modelAttr, ok := spanAttrs[modelAttrKey]; ok {
+			if _, ok := run.Extra[LangSmithInvocationParams]; !ok {
+				run.Extra[LangSmithInvocationParams] = make(map[string]interface{})
+			}
+			if modelAttr.Value != nil {
+				parts := strings.Split(modelAttrKey, ".")
+				key := parts[len(parts)-1]
+				if value := extractProtobufValue(modelAttr.Value); value != nil {
+					run.Extra[LangSmithInvocationParams].(map[string]interface{})[key] = value
+				}
+			}
+		}
+	}
+	// handle non-trace loop invocation params
+	if ArizeInvocationParams, ok := spanAttrs["llm.invocation_parameters"]; ok {
+		if stringValue, ok := ArizeInvocationParams.Value.(*commonpb.AnyValue_StringValue); ok {
+			if _, ok := run.Extra[LangSmithInvocationParams]; !ok {
+				run.Extra[LangSmithInvocationParams] = make(map[string]interface{})
+			}
+			var params map[string]interface{}
+			if err := json.Unmarshal([]byte(stringValue.StringValue), &params); err == nil {
+				for key, value := range params {
+					run.Extra[LangSmithInvocationParams].(map[string]interface{})[key] = value
+				}
+			}
+		}
+	}
+
+	// Logfire “tools” list -> invocation_params.tools
+	if toolsAttr, ok := spanAttrs["tools"]; ok {
+		if _, ok := run.Extra[LangSmithInvocationParams]; !ok {
+			run.Extra[LangSmithInvocationParams] = make(map[string]interface{})
+		}
+		switch v := toolsAttr.Value.(type) {
+		case *commonpb.AnyValue_ArrayValue:
+			toolNames := make([]interface{}, len(v.ArrayValue.Values))
+			for i, av := range v.ArrayValue.Values {
+				if av != nil {
+					toolNames[i] = extractProtobufValue(av.Value)
+				}
+			}
+			run.Extra[LangSmithInvocationParams].(map[string]interface{})["tools"] = toolNames
+		case *commonpb.AnyValue_StringValue:
+			var arr []interface{}
+			if err := json.Unmarshal([]byte(v.StringValue), &arr); err == nil {
+				run.Extra[LangSmithInvocationParams].(map[string]interface{})["tools"] = arr
+			} else {
+				run.Extra[LangSmithInvocationParams].(map[string]interface{})["tools"] = []interface{}{v.StringValue}
+			}
+		}
+	}
+
+	if toolNameAttr, ok := spanAttrs["gen_ai.tool.name"]; ok {
+		if _, ok := run.Extra[LangSmithInvocationParams]; !ok {
+			run.Extra[LangSmithInvocationParams] = make(map[string]interface{})
+		}
+		if v := extractProtobufValue(toolNameAttr.Value); v != nil {
+			run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_name"] = v
+		}
+		run.RunType = strPointer(model.RunTypeTool)
+	}
+
+	if argsAttr, ok := spanAttrs["tool_arguments"]; ok {
+		if _, ok := run.Extra[LangSmithInvocationParams]; !ok {
+			run.Extra[LangSmithInvocationParams] = make(map[string]interface{})
+		}
+
+		switch v := argsAttr.Value.(type) {
+		case *commonpb.AnyValue_StringValue:
+			var obj map[string]interface{}
+			if err := json.Unmarshal([]byte(v.StringValue), &obj); err == nil {
+				run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_arguments"] = obj
+			} else {
+				run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_arguments"] = v.StringValue
+			}
+
+		case *commonpb.AnyValue_KvlistValue:
+			kv := make(map[string]interface{})
+			for _, kvp := range v.KvlistValue.Values {
+				kv[kvp.Key] = extractProtobufValue(kvp.Value)
+			}
+			run.Extra[LangSmithInvocationParams].(map[string]interface{})["tool_arguments"] = kv
+		}
+	}
+
+	// Process system from gen_ai.system
+	if systemAttr, ok := spanAttrs[TraceLoopGenAISystem]; ok {
+		if stringValue, ok := systemAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.Extra[LangSmithMetadata].(map[string]interface{})[LangSmithLSProvider] = stringValue.StringValue
+		}
+	} else if systemAttr, ok := spanAttrs[OpenInferenceSystem]; ok {
+		if stringValue, ok := systemAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+			run.Extra[LangSmithMetadata].(map[string]interface{})[LangSmithLSProvider] = stringValue.StringValue
+		}
+	}
+
+	if modelName, ok := extractModelName(spanAttrs); ok {
+		run.Extra[LangSmithMetadata].(map[string]interface{})[LangSmithModelName] = modelName
+	}
+
+	// Process prompt
+	inputAttr, ok := spanAttrs["input.value"]
+	templateAttr, ok_prompt := spanAttrs["llm.prompt_template.variables"]
+	if ok_prompt {
+		run.RunType = strPointer(model.RunTypePrompt)
+	}
+	if ok && ok_prompt {
+		if stringValue, ok := inputAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+			// Try to parse as JSON first
+			var inputMap map[string]interface{}
+			if err := json.Unmarshal([]byte(stringValue.StringValue), &inputMap); err == nil {
+				// If successful JSON parse, use the parsed map
+				run.Inputs = inputMap
+			} else {
+				// If not JSON, try to match against template variables
+				if templateValue, ok := templateAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+					var templateVars map[string]interface{}
+					if err := json.Unmarshal([]byte(templateValue.StringValue), &templateVars); err == nil {
+						// Find which variable matches the input value
+						inputStr := stringValue.StringValue
+						for key, val := range templateVars {
+							if strVal, ok := val.(string); ok && strVal == inputStr {
+								run.Inputs = map[string]interface{}{
+									key: inputStr,
+								}
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Process Arize retriever
+	if *runType == "retriever" {
+		if inputAttr, ok := spanAttrs["input.value"]; ok {
+			if stringValue, ok := inputAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+				run.Inputs = map[string]interface{}{
+					"query": stringValue.StringValue,
+				}
+			}
+		}
+
+		// Handle retrieval outputs
+		formattedDocs := make([]interface{}, 0)
+
+		// Look for document content and metadata pairs
+		i := 0
+		for {
+			contentKey := fmt.Sprintf("retrieval.documents.%d.document.content", i)
+			metadataKey := fmt.Sprintf("retrieval.documents.%d.document.metadata", i)
+
+			contentAttr, hasContent := spanAttrs[contentKey]
+			metadataAttr, hasMetadata := spanAttrs[metadataKey]
+
+			if !hasContent || !hasMetadata {
+				break
+			}
+
+			if contentValue, ok := contentAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+				if metadataValue, ok := metadataAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+					var metadata map[string]interface{}
+					if err := json.Unmarshal([]byte(metadataValue.StringValue), &metadata); err == nil {
+						formattedDocs = append(formattedDocs, map[string]interface{}{
+							"page_content": contentValue.StringValue,
+							"metadata":     metadata,
+							"type":         "Document",
+						})
+					}
+				}
+			}
+			i++
+		}
+
+		if len(formattedDocs) > 0 {
+			run.Outputs = map[string]interface{}{
+				"documents": formattedDocs,
+			}
+		}
+	}
+
+	// Process input messages
+	if prompts := extractMessages("gen_ai.prompt", spanAttrs); len(prompts) > 0 && run.Inputs == nil {
+		run.Inputs = map[string]interface{}{
+			"messages": prompts,
+		}
+	} else if inputMessages := extractMessages("llm.input_messages", spanAttrs); len(inputMessages) > 0 && run.Inputs == nil {
+		run.Inputs = map[string]interface{}{
+			"messages": inputMessages,
+		}
+	}
+
+	// Process completions
+	if completions := extractMessages("gen_ai.completion", spanAttrs); len(completions) > 0 && run.Outputs == nil {
+		run.Outputs = map[string]interface{}{
+			"messages": completions,
+		}
+	} else if completions := extractMessages("llm.output_messages", spanAttrs); len(completions) > 0 && run.Outputs == nil {
+		run.Outputs = map[string]interface{}{
+			"messages": completions,
+		}
+	}
+
+	// full inputs
+	for _, spanInputAttr := range []string{OpenInferenceInput, TraceLoopEntityInput, GenAIPrompt, LogfirePrompt} {
+		if spanInput, ok := spanAttrs[spanInputAttr]; ok {
+			var input map[string]interface{}
+			if stringValue, ok := spanInput.Value.(*commonpb.AnyValue_StringValue); ok {
+				if err := json.Unmarshal([]byte(stringValue.StringValue), &input); err == nil {
+					if run.Inputs == nil {
+
+						run.Inputs = input
+					}
+				}
+			}
+		}
+	}
+
+	// full outputs
+	for _, spanOutputAttr := range []string{OpenInferenceOutput, TraceLoopEntityOutput, GenAICompletion, LogfireAllMessagesEvents} {
+		if spanOutput, ok := spanAttrs[spanOutputAttr]; ok {
+			var output map[string]interface{}
+			if stringValue, ok := spanOutput.Value.(*commonpb.AnyValue_StringValue); ok {
+				outputStr := stringValue.StringValue
+				// Try to unmarshal as JSON first
+				if err := json.Unmarshal([]byte(outputStr), &output); err != nil {
+					// If it fails, wrap the text in a JSON structure
+					output = map[string]interface{}{
+						"text": outputStr,
+					}
+				}
+				// Convert embedding arrays to []float64 if present
+				if data, ok := output["data"].([]interface{}); ok {
+					for _, item := range data {
+						if embeddingMap, ok := item.(map[string]interface{}); ok {
+							if embedding, ok := embeddingMap["embedding"].([]interface{}); ok {
+								embeddingMap["embedding"] = convertToFloat64Array(embedding)
+							}
+						}
+					}
+				}
+
+				if run.Outputs == nil {
+					run.Outputs = output
+				}
+			}
+		}
+	}
+
+	if evtAttr, ok := spanAttrs[LogfireEvents]; ok && (run.Inputs == nil || run.Outputs == nil) {
+		var rawEvents []interface{}
+		switch v := evtAttr.Value.(type) {
+		case *commonpb.AnyValue_StringValue:
+			_ = json.Unmarshal([]byte(v.StringValue), &rawEvents) // ignore error -> empty slice
+		case *commonpb.AnyValue_ArrayValue:
+			rawEvents = make([]interface{}, len(v.ArrayValue.Values))
+			for i, av := range v.ArrayValue.Values {
+				rawEvents[i] = extractProtobufValue(av)
+			}
+		}
+
+		if len(rawEvents) > 0 {
+			var choiceEvent map[string]interface{}
+			inputEvents := make([]interface{}, 0)
+
+			for _, ev := range rawEvents {
+				if m, ok := ev.(map[string]interface{}); ok {
+					if m["event.name"] == "gen_ai.choice" {
+						choiceEvent = m
+					} else {
+						inputEvents = append(inputEvents, m)
+					}
+				}
+			}
+
+			if run.Inputs == nil && len(inputEvents) > 0 {
+				run.Inputs = map[string]interface{}{"input": inputEvents}
+			}
+			if run.Outputs == nil && choiceEvent != nil {
+				run.Outputs = choiceEvent
+			}
+		}
+	}
+
+	// Add metadata
+	addPrefixedAttributesToMetadata(spanAttrs, TraceLoopAssociationProperties, run.Extra[LangSmithMetadata].(map[string]interface{}))
+	addPrefixedAttributesToMetadata(spanAttrs, LangSmithMetadataPrefix, run.Extra[LangSmithMetadata].(map[string]interface{}))
+
+	// Parse and set tags
+	if tagsAttr, ok := spanAttrs[LangSmithTags]; ok {
+		if stringValue, ok := tagsAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+			tagStr := stringValue.StringValue
+			tagSlice := strings.Split(tagStr, ",")
+			for i, tag := range tagSlice {
+				tagSlice[i] = strings.TrimSpace(tag)
+			}
+			run.Tags = tagSlice
+		}
+	}
+	// Add OpenInference metadata
+	if metadataAttr, ok := spanAttrs["metadata"]; ok {
+		if stringValue, ok := metadataAttr.Value.(*commonpb.AnyValue_StringValue); ok {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal([]byte(stringValue.StringValue), &metadata); err == nil {
+				// Add parsed metadata to run's metadata map
+				for key, value := range metadata {
+					run.Extra[LangSmithMetadata].(map[string]interface{})[key] = value
+				}
+			}
+		}
+	}
+
+	// Allow generic OpenTelemetry attributes when enabled
+	if genericOtelEnabled {
+		metadata := run.Extra[LangSmithMetadata].(map[string]interface{})
+		for key, attr := range spanAttrs {
+			if strings.HasPrefix(key, TraceLoopAssociationProperties) ||
+				strings.HasPrefix(key, "gen_ai.") ||
+				strings.HasPrefix(key, "llm.") ||
+				strings.HasPrefix(key, "langsmith.") ||
+				key == TraceLoopEntityInput ||
+				key == OpenInferenceInput ||
+				key == TraceLoopEntityOutput ||
+				key == OpenInferenceOutput ||
+				key == TraceLoopEntityName ||
+				key == TraceLoopSpanKind ||
+				key == OpenInferenceSpanKind {
+				continue
+			}
+
+			// Add generic attribute to metadata
+			if value := extractProtobufValue(attr.Value); value != nil {
+				metadata[key] = value
+			}
+		}
+	}
+
+	// Process token usage
+	if run.Outputs != nil {
+		usageMetadata := map[string]interface{}{}
+
+		if promptTokens, ok := spanAttrs[GenAIUsagePromptTokens]; ok {
+			if intValue, ok := promptTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["input_tokens"] = intValue.IntValue
+			}
+		} else if inputTokens, ok := spanAttrs[GenAIUsageInputTokens]; ok {
+			if intValue, ok := inputTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["input_tokens"] = intValue.IntValue
+			}
+		} else if promptTokens, ok := spanAttrs["llm.token_count.prompt"]; ok {
+			if intValue, ok := promptTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["input_tokens"] = intValue.IntValue
+			}
+		}
+
+		if completionTokens, ok := spanAttrs[GenAIUsageCompletionTokens]; ok {
+			if intValue, ok := completionTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["output_tokens"] = intValue.IntValue
+			}
+		} else if outputTokens, ok := spanAttrs[GenAIUsageOutputTokens]; ok {
+			if intValue, ok := outputTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["output_tokens"] = intValue.IntValue
+			}
+		} else if completionTokens, ok := spanAttrs["llm.token_count.completion"]; ok {
+			if intValue, ok := completionTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["output_tokens"] = intValue.IntValue
+			}
+		}
+
+		if totalTokens, ok := spanAttrs[GenAIUsageTotalTokens]; ok {
+			if intValue, ok := totalTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["total_tokens"] = intValue.IntValue
+			}
+		} else if totalTokens, ok := spanAttrs["llm.usage.total_tokens"]; ok {
+			if intValue, ok := totalTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["total_tokens"] = intValue.IntValue
+			}
+		} else if totalTokens, ok := spanAttrs["llm.token_count.total"]; ok {
+			if intValue, ok := totalTokens.Value.(*commonpb.AnyValue_IntValue); ok {
+				usageMetadata["total_tokens"] = intValue.IntValue
+			}
+		}
+
+		if len(usageMetadata) > 0 {
+			run.Outputs["usage_metadata"] = usageMetadata
+		}
+	}
+	// Process error events
+	for _, event := range span.Events {
+		if event.Name == "exception" {
+			run.Status = strPointer("error")
+			for _, attr := range event.Attributes {
+				switch attr.Key {
+				case "exception.message":
+					if stringValue, ok := attr.Value.Value.(*commonpb.AnyValue_StringValue); ok {
+						run.Error = strPointer(stringValue.StringValue)
+					}
+				case "exception.stacktrace":
+					if stringValue, ok := attr.Value.Value.(*commonpb.AnyValue_StringValue); ok {
+						if run.Error != nil {
+							*run.Error += "\n\nStacktrace:\n" + stringValue.StringValue
+						} else {
+							run.Error = strPointer("Stacktrace:\n" + stringValue.StringValue)
+						}
+					}
+				}
+			}
+			break
+		}
+	}
+	// Set run.Status to "success" if not already set to "error"
+	if run.Status == nil || *run.Status != "error" {
+		run.Status = strPointer("success")
+	}
+
+	return run, nil
+}
+
+// Helper function to extract messages from attributes with a given prefix
 func extractMessages(prefix string, spanAttrs map[string]*commonpb.AnyValue) []map[string]interface{} {
 	messages := []map[string]interface{}{}
 	for i := 0; ; i++ {
@@ -914,8 +789,6 @@ func getRunType(spanAttrs map[string]*commonpb.AnyValue) (*string, error) {
 
 func extractFromEvents(events []*tracesdkpb.Span_Event) (map[string]interface{}, map[string]interface{}) {
 	var inputs, outputs map[string]interface{}
-	var messages []map[string]interface{}
-	var assistantMessages []map[string]interface{}
 
 	for _, event := range events {
 		eventAttrs := make(map[string]*commonpb.AnyValue)
@@ -931,13 +804,13 @@ func extractFromEvents(events []*tracesdkpb.Span_Event) (map[string]interface{},
 					if err := json.Unmarshal([]byte(stringValue.StringValue), &promptMap); err == nil {
 						inputs = promptMap
 					} else {
+						// If not JSON, use as plain string
 						inputs = map[string]interface{}{
 							"input": stringValue.StringValue,
 						}
 					}
 				}
 			}
-
 		case GenAIContentCompletion:
 			if completionAttr, ok := eventAttrs[GenAICompletion]; ok {
 				if stringValue, ok := completionAttr.Value.(*commonpb.AnyValue_StringValue); ok {
@@ -945,217 +818,15 @@ func extractFromEvents(events []*tracesdkpb.Span_Event) (map[string]interface{},
 					if err := json.Unmarshal([]byte(stringValue.StringValue), &completionMap); err == nil {
 						outputs = completionMap
 					} else {
+						// If not JSON, use as plain string
 						outputs = map[string]interface{}{
 							"output": stringValue.StringValue,
 						}
 					}
 				}
 			}
-
-		case GenAISystemMessageEvent, GenAIUserMessageEvent:
-			message := extractMessageFromEvent(event, eventAttrs)
-			if message != nil {
-				messages = append(messages, message)
-			}
-
-		case GenAIAssistantMessageEvent:
-			// Extract assistant responses
-			message := extractMessageFromEvent(event, eventAttrs)
-			if message != nil {
-				assistantMessages = append(assistantMessages, message)
-			}
-
-		case GenAIToolMessageEvent:
-			// Extract tool responses with special handling
-			message := extractToolMessageFromEvent(event, eventAttrs)
-			if message != nil {
-				assistantMessages = append(assistantMessages, message)
-			}
-
-		case GenAIChoiceEvent:
-			choice := extractChoiceFromEvent(event, eventAttrs)
-			if choice != nil {
-				outputs = choice
-			}
 		}
-	}
-
-	if len(messages) > 0 && inputs == nil {
-		inputs = map[string]interface{}{"messages": messages}
-	}
-	if len(assistantMessages) > 0 && outputs == nil {
-		outputs = map[string]interface{}{"messages": assistantMessages}
 	}
 
 	return inputs, outputs
-}
-
-func extractMessageFromEvent(event *tracesdkpb.Span_Event, eventAttrs map[string]*commonpb.AnyValue) map[string]interface{} {
-	// Microsoft Semantic Kernel specific
-	if eventContent, ok := eventAttrs[GenAIEventContent]; ok {
-		if stringValue, ok := eventContent.Value.(*commonpb.AnyValue_StringValue); ok {
-			var message map[string]interface{}
-			if err := json.Unmarshal([]byte(stringValue.StringValue), &message); err == nil {
-				return message
-			}
-		}
-	}
-
-	message := make(map[string]interface{})
-
-	// Extract content
-	if content, ok := eventAttrs["content"]; ok {
-		if value := extractProtobufValue(content.Value); value != nil {
-			message["content"] = value
-		}
-	}
-
-	// Extract role
-	if role, ok := eventAttrs["role"]; ok {
-		if value := extractProtobufValue(role.Value); value != nil {
-			message["role"] = value
-		}
-	}
-
-	// For tool messages, extract additional fields
-	if event.Name == GenAIToolMessageEvent {
-		if id, ok := eventAttrs["id"]; ok {
-			if value := extractProtobufValue(id.Value); value != nil {
-				message["tool_call_id"] = value
-			}
-		}
-	}
-
-	if len(message) > 0 {
-		return message
-	}
-	return nil
-}
-
-func extractToolMessageFromEvent(event *tracesdkpb.Span_Event, eventAttrs map[string]*commonpb.AnyValue) map[string]interface{} {
-	// Microsoft Semantic Kernel specific
-	if eventContent, ok := eventAttrs[GenAIEventContent]; ok {
-		if stringValue, ok := eventContent.Value.(*commonpb.AnyValue_StringValue); ok {
-			var message map[string]interface{}
-			if err := json.Unmarshal([]byte(stringValue.StringValue), &message); err == nil {
-				if _, hasID := message["id"]; hasID {
-					return message
-				}
-				if _, hasContent := message["content"]; hasContent {
-					return message
-				}
-			}
-		}
-	}
-
-	// Standard extraction
-	return extractMessageFromEvent(event, eventAttrs)
-}
-
-func extractChoiceFromEvent(event *tracesdkpb.Span_Event, eventAttrs map[string]*commonpb.AnyValue) map[string]interface{} {
-	// Microsoft Semantic Kernel specific
-	if eventContent, ok := eventAttrs[GenAIEventContent]; ok {
-		if stringValue, ok := eventContent.Value.(*commonpb.AnyValue_StringValue); ok {
-			var choice map[string]interface{}
-			if err := json.Unmarshal([]byte(stringValue.StringValue), &choice); err == nil {
-				if _, hasMessage := choice["message"]; hasMessage {
-					return choice
-				}
-			}
-		}
-	}
-	choice := make(map[string]interface{})
-
-	// Extract finish reason
-	if finishReason, ok := eventAttrs["finish_reason"]; ok {
-		if value := extractProtobufValue(finishReason.Value); value != nil {
-			choice["finish_reason"] = value
-		}
-	}
-
-	// Extract message content
-	if messageContent, ok := eventAttrs["message.content"]; ok {
-		if value := extractProtobufValue(messageContent.Value); value != nil {
-			if _, exists := choice["message"]; !exists {
-				choice["message"] = make(map[string]interface{})
-			}
-			choice["message"].(map[string]interface{})["content"] = value
-		}
-	}
-
-	// Extract message role
-	if messageRole, ok := eventAttrs["message.role"]; ok {
-		if value := extractProtobufValue(messageRole.Value); value != nil {
-			if _, exists := choice["message"]; !exists {
-				choice["message"] = make(map[string]interface{})
-			}
-			choice["message"].(map[string]interface{})["role"] = value
-		}
-	}
-
-	if toolCalls := extractToolCallsFromEventAttrs(eventAttrs); len(toolCalls) > 0 {
-		choice["tool_calls"] = toolCalls
-	}
-
-	if len(choice) > 0 {
-		return choice
-	}
-	return nil
-}
-
-func extractToolCallsFromEventAttrs(eventAttrs map[string]*commonpb.AnyValue) []map[string]interface{} {
-	var toolCalls []map[string]interface{}
-
-	for i := 0; ; i++ {
-		toolCall := make(map[string]interface{})
-
-		idKey := fmt.Sprintf("tool_calls.%d.id", i)
-		if id, ok := eventAttrs[idKey]; ok {
-			if value := extractProtobufValue(id.Value); value != nil {
-				toolCall["id"] = value
-			}
-		} else {
-			break
-		}
-
-		// Extract function name
-		nameKey := fmt.Sprintf("tool_calls.%d.function.name", i)
-		if name, ok := eventAttrs[nameKey]; ok {
-			if value := extractProtobufValue(name.Value); value != nil {
-				if _, exists := toolCall["function"]; !exists {
-					toolCall["function"] = make(map[string]interface{})
-				}
-				toolCall["function"].(map[string]interface{})["name"] = value
-			}
-		}
-
-		// Extract function arguments
-		argsKey := fmt.Sprintf("tool_calls.%d.function.arguments", i)
-		if args, ok := eventAttrs[argsKey]; ok {
-			if value := extractProtobufValue(args.Value); value != nil {
-				if _, exists := toolCall["function"]; !exists {
-					toolCall["function"] = make(map[string]interface{})
-				}
-				toolCall["function"].(map[string]interface{})["arguments"] = value
-			}
-		}
-
-		// Extract type
-		typeKey := fmt.Sprintf("tool_calls.%d.type", i)
-		if toolType, ok := eventAttrs[typeKey]; ok {
-			if value := extractProtobufValue(toolType.Value); value != nil {
-				toolCall["type"] = value
-			}
-		}
-
-		if len(toolCall) > 0 {
-			toolCalls = append(toolCalls, toolCall)
-		}
-	}
-
-	return toolCalls
-}
-
-func strPointer(s string) *string {
-	return &s
 }
