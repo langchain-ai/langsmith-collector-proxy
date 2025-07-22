@@ -62,6 +62,7 @@ const (
 	LangSmithTags               = "langsmith.span.tags"
 	LangSmithUsageMetadata      = "langsmith.usage_metadata"
 	LangSmithReferenceExampleID = "langsmith.reference_example_id"
+	LangSmithRoot               = "langsmith.is_root"
 
 	// LangSmith, see: https://docs.smith.langchain.com/observability/how_to_guides/tracing/log_llm_trace
 	LangSmithInvocationParams = "invocation_params"
@@ -171,7 +172,8 @@ func initializeRun(ctx *spanContext) (*model.Run, error) {
 	}
 
 	var parentID *string
-	if len(ctx.span.ParentSpanId) > 0 {
+	isLangSmithRoot := getStringValue(ctx.attrs, LangSmithRoot) == "true"
+	if !isLangSmithRoot && len(ctx.span.ParentSpanId) > 0 {
 		parsed, err := idToUUID(ctx.span.ParentSpanId)
 		if err != nil {
 			return nil, err

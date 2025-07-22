@@ -35,6 +35,9 @@ func main() {
 		BatchSize:      cfg.BatchSize,
 		FlushInterval:  cfg.FlushInterval,
 		MaxBufferBytes: cfg.MaxBufferBytes,
+		FilterConfig: aggregator.FilterConfig{
+			FilterNonGenAI: cfg.FilterNonGenAI,
+		},
 	}, ch)
 	agg.Start()
 	defer agg.Stop()

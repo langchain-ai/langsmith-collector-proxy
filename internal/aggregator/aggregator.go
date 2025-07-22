@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,12 +13,63 @@ import (
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/util"
 )
 
+type entry struct {
+	dotted string
+	ts     time.Time
+}
+
+type RunFilter func(run *model.Run) bool
+
+type FilterConfig struct {
+	// FilterNonGenAI determines if non-GenAI runs should be filtered out
+	FilterNonGenAI bool
+	// CustomFilter is an optional custom filter function
+	CustomFilter RunFilter
+}
+
+var IncludePrefixes = []string{"gen_ai.", "langsmith.", "llm.", "ai."}
+
+func DefaultGenAIFilter(run *model.Run) bool {
+	if run.Name != nil {
+		for _, prefix := range IncludePrefixes {
+			if strings.HasPrefix(*run.Name, prefix) {
+				return true
+			}
+		}
+	}
+
+	if run.Extra != nil {
+		for key := range run.Extra {
+			for _, prefix := range IncludePrefixes {
+				if strings.HasPrefix(key, prefix) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func (fc FilterConfig) ShouldKeepRun(run *model.Run) bool {
+	if fc.CustomFilter != nil {
+		return fc.CustomFilter(run)
+	}
+
+	if fc.FilterNonGenAI {
+		return DefaultGenAIFilter(run)
+	}
+
+	return true
+}
+
 type Config struct {
 	BatchSize      int
 	FlushInterval  time.Duration
 	MaxBufferBytes int
 	GCInterval     time.Duration
 	EntryTTL       time.Duration
+	FilterConfig   FilterConfig
 }
 
 // Aggregator resolves dotted_order for each run and adds them to a compressed
@@ -32,10 +84,11 @@ type Config struct {
 // Aggregator will flush runs to the uploader at a regular interval and garbage
 // collect runs that have not been updated for a given TTL.
 type Aggregator struct {
-	ch     chan *model.Run
-	cfg    Config
-	up     *uploader.Uploader
-	cancel context.CancelFunc
+	ch          chan *model.Run
+	cfg         Config
+	up          *uploader.Uploader
+	cancel      context.CancelFunc
+	filteredIDs sync.Map
 }
 
 func New(up *uploader.Uploader, cfg Config, ch chan *model.Run) *Aggregator {
@@ -74,14 +127,10 @@ func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
 	sc := serializer.NewStreamingCompressor()
 	var scMu sync.Mutex
 
-	type entry struct {
-		dotted string
-		ts     time.Time
-	}
-
 	dottedByRunID := make(map[string]entry)          // runID → dotted_order
 	waitingChildren := make(map[string][]*model.Run) // parentID → parked kids
 	waitingSince := make(map[string]time.Time)       // parentID → first‑park time
+	parentByRunID := make(map[string]string)         // runID → parentID (for filtered runs)
 
 	flush := func() {
 		scMu.Lock()
@@ -184,6 +233,39 @@ func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
 			if r == nil {
 				continue
 			}
+
+			// Track parent relationship before filtering
+			if r.ID != nil && r.ParentRunID != nil {
+				parentByRunID[*r.ID] = *r.ParentRunID
+			}
+
+			// Apply filtering
+			shouldKeep := a.cfg.FilterConfig.ShouldKeepRun(r)
+			if !shouldKeep {
+				// Track this as a filtered run
+				if r.ID != nil {
+					a.filteredIDs.Store(*r.ID, true)
+				}
+
+				// Reparent any waiting children of this filtered run
+				if r.ID != nil {
+					a.reparentChildrenOfFiltered(*r.ID, waitingChildren, waitingSince, dottedByRunID, add, cascade, parentByRunID)
+				}
+				continue
+			}
+
+			// Check if this run's parent was filtered and reparent if needed
+			if r.ParentRunID != nil {
+				newParentID := a.findValidParent(*r.ParentRunID, parentByRunID)
+				if newParentID != *r.ParentRunID {
+					if newParentID == "" {
+						r.ParentRunID = nil
+					} else {
+						r.ParentRunID = &newParentID
+					}
+				}
+			}
+
 			switch {
 			case r.ParentRunID == nil || *r.ParentRunID == "":
 				if r.RootSpanID != nil {
@@ -229,4 +311,86 @@ func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
 			gc()
 		}
 	}
+}
+
+func (a *Aggregator) reparentChildrenOfFiltered(
+	filteredRunID string,
+	waitingChildren map[string][]*model.Run,
+	waitingSince map[string]time.Time,
+	dottedByRunID map[string]entry,
+	add func(*model.Run),
+	cascade func(string, string),
+	parentByRunID map[string]string,
+) {
+	children := waitingChildren[filteredRunID]
+	if len(children) == 0 {
+		return
+	}
+
+	// Remove children from the filtered parent
+	delete(waitingChildren, filteredRunID)
+	delete(waitingSince, filteredRunID)
+
+	// Reparent each child
+	for _, child := range children {
+		if child.ParentRunID != nil {
+			// Find valid grandparent for this child
+			newParentID := a.findValidParent(*child.ParentRunID, parentByRunID)
+			if newParentID == "" {
+				child.ParentRunID = nil
+			} else {
+				child.ParentRunID = &newParentID
+			}
+		}
+
+		// Try to place the child in its new location
+		if child.ParentRunID == nil || *child.ParentRunID == "" {
+			// Child becomes a root run
+			d := util.NewDottedOrder(*child.ID)
+			child.DottedOrder = &d
+			dottedByRunID[*child.ID] = entry{dotted: d, ts: time.Now()}
+			add(child)
+			cascade(*child.ID, d)
+		} else {
+			parentID := *child.ParentRunID
+			if p, ok := dottedByRunID[parentID]; ok {
+				// New parent exists, assign dotted order and add
+				d := p.dotted + "." + util.NewDottedOrder(*child.ID)
+				child.DottedOrder = &d
+				dottedByRunID[*child.ID] = entry{dotted: d, ts: time.Now()}
+				add(child)
+				cascade(*child.ID, d)
+			} else {
+				// New parent doesn't exist yet, wait for it
+				waitingChildren[parentID] = append(waitingChildren[parentID], child)
+				if _, ok := waitingSince[parentID]; !ok {
+					waitingSince[parentID] = time.Now()
+				}
+			}
+		}
+	}
+}
+
+// findValidParent walks up the ancestry to find the first non-filtered parent
+func (a *Aggregator) findValidParent(parentID string, parentByRunID map[string]string) string {
+	currentID := parentID
+
+	for currentID != "" {
+		// If this parent is filtered, continue up the tree
+		if _, isFiltered := a.filteredIDs.Load(currentID); isFiltered {
+			// Look for this filtered parent's parent in parentByRunID
+			if grandParentID, exists := parentByRunID[currentID]; exists {
+				currentID = grandParentID
+				continue
+			} else {
+				// Can't find parent of filtered run, return empty (becomes root)
+				return ""
+			}
+		} else {
+			// Found a non-filtered parent
+			return currentID
+		}
+	}
+	// No valid parent found
+	return ""
 }
