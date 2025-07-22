@@ -7,6 +7,7 @@ import (
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/model"
+	"github.com/langchain-ai/langsmith-collector-proxy/internal/util"
 )
 
 type spanEntry struct {
@@ -86,7 +87,7 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 				}
 				if len(span.ParentSpanId) == 0 {
 					if spanUUID, err := idToUUID(span.SpanId); err == nil {
-						run.RootSpanID = strPointer(spanUUID.String())
+						run.RootSpanID = util.StringPtr(spanUUID.String())
 					}
 					if traceUUID, err := idToUUID(span.TraceId); err == nil {
 						traceStr := traceUUID.String()
@@ -95,7 +96,7 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 				} else if run.ParentRunID != nil {
 					t.mu.RLock()
 					if m, ok := t.span2trace[*run.ParentRunID]; ok {
-						run.ParentRunID = strPointer(m.trace)
+						run.ParentRunID = util.StringPtr(m.trace)
 					}
 					t.mu.RUnlock()
 				}
