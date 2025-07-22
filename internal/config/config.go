@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,7 @@ type Config struct {
 	MaxBufferBytes int
 	MaxRetries     int
 	BackoffInitial time.Duration
+	FilterNonGenAI bool
 }
 
 func env(key, def string) string {
@@ -31,6 +33,13 @@ func envInt64(key string, def int64) int64 {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		return strings.ToLower(v) == "true"
 	}
 	return def
 }
@@ -57,5 +66,7 @@ func Load() Config {
 		// Uploader Config
 		MaxRetries:     int(envInt64("MAX_RETRIES", 3)),
 		BackoffInitial: time.Duration(envInt64("RETRY_BACKOFF_MS", 100)) * time.Millisecond,
+		// Filter Config
+		FilterNonGenAI: envBool("FILTER_NON_GENAI", false),
 	}
 }
