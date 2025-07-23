@@ -259,7 +259,7 @@ func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
 				newParentID := a.findValidParent(*r.ParentRunID, parentByRunID)
 				if newParentID != *r.ParentRunID {
 					if newParentID == "" {
-						r.ParentRunID = nil
+						r.ParentRunID = r.TraceID
 					} else {
 						r.ParentRunID = &newParentID
 					}
@@ -337,7 +337,7 @@ func (a *Aggregator) reparentChildrenOfFiltered(
 			// Find valid grandparent for this child
 			newParentID := a.findValidParent(*child.ParentRunID, parentByRunID)
 			if newParentID == "" {
-				child.ParentRunID = nil
+				child.ParentRunID = child.TraceID
 			} else {
 				child.ParentRunID = &newParentID
 			}

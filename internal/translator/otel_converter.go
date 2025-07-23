@@ -172,7 +172,7 @@ func initializeRun(ctx *spanContext) (*model.Run, error) {
 	}
 
 	var parentID *string
-	isLangSmithRoot := getStringValue(ctx.attrs, LangSmithRoot) == "true"
+	isLangSmithRoot := getBoolValue(ctx.attrs, LangSmithRoot)
 	if !isLangSmithRoot && len(ctx.span.ParentSpanId) > 0 {
 		parsed, err := idToUUID(ctx.span.ParentSpanId)
 		if err != nil {
@@ -745,6 +745,15 @@ func getIntValue(attrs map[string]*commonpb.AnyValue, key string) *int64 {
 		}
 	}
 	return nil
+}
+
+func getBoolValue(attrs map[string]*commonpb.AnyValue, key string) bool {
+	if attr, ok := attrs[key]; ok {
+		if v, ok := attr.Value.(*commonpb.AnyValue_BoolValue); ok {
+			return v.BoolValue
+		}
+	}
+	return false
 }
 
 func getAttrValue(attrs map[string]*commonpb.AnyValue, key string) interface{} {

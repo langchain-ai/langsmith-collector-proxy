@@ -5,6 +5,7 @@ import (
 	"time"
 
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/model"
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/util"
@@ -72,7 +73,10 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 	for _, rs := range req.ResourceSpans {
 		for _, ss := range rs.ScopeSpans {
 			for _, span := range ss.Spans {
-				if len(span.ParentSpanId) == 0 {
+				// check if the span is a langsmith root span
+				isLangSmithRoot := getBoolAttribute(span.Attributes, LangSmithRoot)
+
+				if len(span.ParentSpanId) == 0 || isLangSmithRoot {
 					if spanUUID, err := idToUUID(span.SpanId); err == nil {
 						if traceUUID, err := idToUUID(span.TraceId); err == nil {
 							t.mu.Lock()
@@ -85,7 +89,7 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 				if err != nil || run == nil {
 					continue
 				}
-				if len(span.ParentSpanId) == 0 {
+				if len(span.ParentSpanId) == 0 || isLangSmithRoot {
 					if spanUUID, err := idToUUID(span.SpanId); err == nil {
 						run.RootSpanID = util.StringPtr(spanUUID.String())
 					}
@@ -105,4 +109,15 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 		}
 	}
 	return runs
+}
+
+func getBoolAttribute(attrs []*commonpb.KeyValue, key string) bool {
+	for _, attr := range attrs {
+		if attr.Key == key && attr.Value != nil {
+			if v, ok := attr.Value.Value.(*commonpb.AnyValue_BoolValue); ok {
+				return v.BoolValue
+			}
+		}
+	}
+	return false
 }
