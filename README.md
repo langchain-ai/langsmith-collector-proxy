@@ -77,9 +77,7 @@ The proxy includes a built-in filter that keeps spans with names or attributes s
 
 When spans are filtered, the proxy automatically maintains the trace hierarchy by:
 1. **Reparenting children**: Child spans of filtered spans are reparented to the closest non-filtered ancestor
-2. **Maintaining structure**: The trace tree structure is preserved even when intermediate spans are removed
-3. **Fallback to root**: If no valid parent is found, spans are attached to the trace root
-4. **Automatic dotted_order**: The aggregator automatically generates correct dotted_order values based on the new parent-child relationships
+2. **Fallback to root**: If no valid parent is found, spans are attached to the trace root
 
 ### Usage Examples
 
