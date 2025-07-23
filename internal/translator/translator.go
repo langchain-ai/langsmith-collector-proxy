@@ -17,18 +17,21 @@ type spanEntry struct {
 }
 
 type Translator struct {
-	converter  *GenAiConverter
-	mu         sync.RWMutex
-	span2trace map[string]spanEntry
-	ttl        time.Duration
-	stop       chan struct{}
+	converter          *GenAiConverter
+	mu                 sync.RWMutex
+	span2trace         map[string]spanEntry
+	ttl                time.Duration
+	stop               chan struct{}
+	genericOtelEnabled bool
 }
 
-func NewTranslator() *Translator {
+func NewTranslator(genericOtelEnabled bool) *Translator {
 	t := &Translator{
-		span2trace: make(map[string]spanEntry),
-		ttl:        5 * time.Minute,
-		stop:       make(chan struct{}),
+		converter:          &GenAiConverter{},
+		span2trace:         make(map[string]spanEntry),
+		ttl:                5 * time.Minute,
+		stop:               make(chan struct{}),
+		genericOtelEnabled: genericOtelEnabled,
 	}
 	if t.ttl > 0 {
 		go t.clean()
@@ -85,7 +88,7 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 						}
 					}
 				}
-				run, err := t.converter.ConvertSpan(span, false)
+				run, err := t.converter.ConvertSpan(span, t.genericOtelEnabled)
 				if err != nil || run == nil {
 					continue
 				}

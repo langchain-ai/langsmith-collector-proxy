@@ -8,17 +8,18 @@ import (
 )
 
 type Config struct {
-	Port           string
-	MaxBodyBytes   int64
-	LangsmithHost  string
-	DefaultAPIKey  string
-	DefaultProject string
-	BatchSize      int
-	FlushInterval  time.Duration
-	MaxBufferBytes int
-	MaxRetries     int
-	BackoffInitial time.Duration
-	FilterNonGenAI bool
+	Port             string
+	MaxBodyBytes     int64
+	LangsmithHost    string
+	DefaultAPIKey    string
+	DefaultProject   string
+	BatchSize        int
+	FlushInterval    time.Duration
+	MaxBufferBytes   int
+	MaxRetries       int
+	BackoffInitial   time.Duration
+	FilterNonGenAI   bool
+	GenericOtelEnabled bool
 }
 
 func env(key, def string) string {
@@ -68,5 +69,7 @@ func Load() Config {
 		BackoffInitial: time.Duration(envInt64("RETRY_BACKOFF_MS", 100)) * time.Millisecond,
 		// Filter Config
 		FilterNonGenAI: envBool("FILTER_NON_GENAI", false),
+		// Generic OTEL Config
+		GenericOtelEnabled: envBool("GENERIC_OTEL_ENABLED", false),
 	}
 }

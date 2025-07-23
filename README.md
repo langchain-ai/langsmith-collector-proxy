@@ -36,6 +36,7 @@ The Collector-Proxy can be customized via environment variables:
 | `MAX_RETRIES`        | Number of retry attempts for failed uploads    | `3`                               |
 | `RETRY_BACKOFF_MS`   | Initial backoff duration in milliseconds       | `100`                             |
 | `FILTER_NON_GENAI`   | Filter out non-GenAI spans (keeps only spans with `gen_ai.`, `langsmith.`, `llm.`, `ai.` prefixes) | `false` |
+| `GENERIC_OTEL_ENABLED` | Include all OpenTelemetry attributes in spans (not just GenAI-specific ones) | `false` |
 
 ## Usage
 
@@ -105,6 +106,17 @@ filterConfig := aggregator.FilterConfig{
 - **Root span filtering**: If the root span of a trace is filtered out, its children may not be properly reparented and could be lost. It's recommended to avoid filtering root spans to maintain trace integrity. If you need to filter root spans, it is recommended to instead use the `langsmith.is_root` attribute to mark a span as a root span.
 
 - **Parent-child relationships**: The proxy automatically maintains the trace hierarchy by reparenting child spans of filtered spans to the closest non-filtered ancestor. This means you must send all spans of a trace to the same collector proxy instance in order to maintain the trace hierarchy and non preemptively filter spans. If the proxy is unable to reparent a span, it will become a root span.
+
+## Generic OpenTelemetry Attributes
+
+By default, the proxy only includes GenAI-specific attributes when converting spans to LangSmith format. To include all OpenTelemetry attributes in the spans, set the `GENERIC_OTEL_ENABLED` environment variable to `true`.
+
+When enabled, this feature will:
+- Include all span attributes in the `extra` field of the LangSmith run
+- Preserve custom attributes that don't follow GenAI semantic conventions
+
+Note: Enabling this feature may increase the payload size sent to LangSmith.
+
 ## Monitoring and Health Checks
 
 The LangSmith Collector-Proxy exposes simple health-check endpoints:
