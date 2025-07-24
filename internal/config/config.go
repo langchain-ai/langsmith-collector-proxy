@@ -8,18 +8,20 @@ import (
 )
 
 type Config struct {
-	Port             string
-	MaxBodyBytes     int64
-	LangsmithHost    string
-	DefaultAPIKey    string
-	DefaultProject   string
-	BatchSize        int
-	FlushInterval    time.Duration
-	MaxBufferBytes   int
-	MaxRetries       int
-	BackoffInitial   time.Duration
-	FilterNonGenAI   bool
+	Port               string
+	MaxBodyBytes       int64
+	LangsmithHost      string
+	DefaultAPIKey      string
+	DefaultProject     string
+	BatchSize          int
+	FlushInterval      time.Duration
+	MaxBufferBytes     int
+	MaxRetries         int
+	BackoffInitial     time.Duration
+	FilterNonGenAI     bool
 	GenericOtelEnabled bool
+	// TTL Configuration
+	SpanTTL time.Duration
 }
 
 func env(key, def string) string {
@@ -41,6 +43,15 @@ func envInt64(key string, def int64) int64 {
 func envBool(key string, def bool) bool {
 	if v := os.Getenv(key); v != "" {
 		return strings.ToLower(v) == "true"
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }
@@ -71,5 +82,7 @@ func Load() Config {
 		FilterNonGenAI: envBool("FILTER_NON_GENAI", false),
 		// Generic OTEL Config
 		GenericOtelEnabled: envBool("GENERIC_OTEL_ENABLED", false),
+		// TTL Config
+		SpanTTL: envDuration("SPAN_TTL", 5*time.Minute),
 	}
 }

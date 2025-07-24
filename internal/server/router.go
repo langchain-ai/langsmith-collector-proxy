@@ -20,7 +20,7 @@ func NewRouter(cfg config.Config, ch chan *model.Run) http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(appmw.Auth(cfg))
 
-	tr := translator.NewTranslator(cfg.GenericOtelEnabled)
+	tr := translator.NewTranslator(cfg.GenericOtelEnabled, cfg.SpanTTL)
 
 	// Health probes
 	r.Get("/live", func(w http.ResponseWriter, _ *http.Request) {
