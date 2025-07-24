@@ -106,7 +106,7 @@ filterConfig := aggregator.FilterConfig{
 
 - **Root span filtering**: If the root span of a trace is filtered out, its children may not be properly reparented and could be lost. It's recommended to avoid filtering root spans to maintain trace integrity. If you need to filter root spans, it is recommended to instead use the `langsmith.is_root` attribute to mark a span as a root span.
 
-- **Parent-child relationships**: The proxy automatically maintains the trace hierarchy by reparenting child spans of filtered spans to the closest non-filtered ancestor. This means you must send all spans of a trace to the same collector proxy instance in order to maintain the trace hierarchy and non preemptively filter spans. If the proxy is unable to reparent a span, it will become a root span.
+- **Parent-child relationships**: The proxy automatically maintains the trace hierarchy by reparenting child spans of filtered spans to the closest non-filtered ancestor. This means you must send all spans of a trace to the same collector proxy instance in order to maintain the trace hierarchy and non preemptively filter spans. If the proxy is unable to reparent a span, it will become parented directly under the root span.
 
 ## Generic OpenTelemetry Attributes
 
