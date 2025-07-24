@@ -37,6 +37,7 @@ The Collector-Proxy can be customized via environment variables:
 | `RETRY_BACKOFF_MS`   | Initial backoff duration in milliseconds       | `100`                             |
 | `FILTER_NON_GENAI`   | Filter out non-GenAI spans (keeps only spans with `gen_ai.`, `langsmith.`, `llm.`, `ai.` prefixes) | `false` |
 | `GENERIC_OTEL_ENABLED` | Include all OpenTelemetry attributes in spans (not just GenAI-specific ones) | `false` |
+| `SPAN_TTL`           | TTL for internal span caches (translator and aggregator) | `5m` |
 
 ## Usage
 

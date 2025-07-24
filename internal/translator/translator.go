@@ -25,11 +25,11 @@ type Translator struct {
 	genericOtelEnabled bool
 }
 
-func NewTranslator(genericOtelEnabled bool) *Translator {
+func NewTranslator(genericOtelEnabled bool, ttl time.Duration) *Translator {
 	t := &Translator{
 		converter:          &GenAiConverter{},
 		span2trace:         make(map[string]spanEntry),
-		ttl:                5 * time.Minute,
+		ttl:                ttl,
 		stop:               make(chan struct{}),
 		genericOtelEnabled: genericOtelEnabled,
 	}
