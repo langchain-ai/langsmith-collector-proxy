@@ -62,10 +62,23 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+
 	log.Printf("shutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("graceful shutdown failed: %v", err)
+		log.Printf("HTTP server shutdown failed: %v", err)
 	}
+
+	close(ch)
+
+	if err := agg.Flush(ctx); err != nil {
+		log.Printf("failed to flush traces: %v", err)
+	}
+
+	agg.Stop()
+
+	log.Printf("shutdown complete")
 }
