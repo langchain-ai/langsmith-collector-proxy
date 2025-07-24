@@ -39,6 +39,11 @@ type Uploader struct {
 	client *http.Client
 }
 
+type UploaderInterface interface {
+	Send(ctx context.Context, b Batch)
+	WaitForCompletion(ctx context.Context) error
+}
+
 func New(cfg Config) *Uploader {
 	return &Uploader{
 		cfg: cfg,
@@ -58,6 +63,16 @@ func (u *Uploader) Send(ctx context.Context, b Batch) {
 		defer u.sem.Release(1)
 		u.send(ctx, b)
 	}()
+}
+
+// WaitForCompletion waits for all in-flight uploads to complete.
+func (u *Uploader) WaitForCompletion(ctx context.Context) error {
+	if err := u.sem.Acquire(ctx, int64(u.cfg.InFlight)); err != nil {
+		return err
+	}
+	// Release all permits immediately
+	u.sem.Release(int64(u.cfg.InFlight))
+	return nil
 }
 
 func (u *Uploader) send(ctx context.Context, b Batch) {

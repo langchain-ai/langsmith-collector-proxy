@@ -86,12 +86,13 @@ type Config struct {
 type Aggregator struct {
 	ch          chan *model.Run
 	cfg         Config
-	up          *uploader.Uploader
+	up          uploader.UploaderInterface
 	cancel      context.CancelFunc
 	filteredIDs sync.Map
+	flushCh     chan struct{}
 }
 
-func New(up *uploader.Uploader, cfg Config, ch chan *model.Run) *Aggregator {
+func New(up uploader.UploaderInterface, cfg Config, ch chan *model.Run) *Aggregator {
 	if cfg.GCInterval == 0 {
 		cfg.GCInterval = 2 * time.Minute
 	}
@@ -107,7 +108,7 @@ func New(up *uploader.Uploader, cfg Config, ch chan *model.Run) *Aggregator {
 	if cfg.FlushInterval == 0 {
 		cfg.FlushInterval = 1 * time.Second
 	}
-	return &Aggregator{up: up, cfg: cfg, ch: ch}
+	return &Aggregator{up: up, cfg: cfg, ch: ch, flushCh: make(chan struct{}, 1)}
 }
 
 func (a *Aggregator) Start() {
@@ -121,6 +122,17 @@ func (a *Aggregator) Stop() {
 	if a.cancel != nil {
 		a.cancel()
 	}
+}
+
+// force a flush of all pending runs
+func (a *Aggregator) Flush(ctx context.Context) error {
+	select {
+	case a.flushCh <- struct{}{}:
+	default:
+		// Channel is full, flush already pending
+	}
+
+	return a.up.WaitForCompletion(ctx)
 }
 
 func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
@@ -305,6 +317,9 @@ func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
 			}
 
 		case <-flushTicker.C:
+			flush()
+
+		case <-a.flushCh:
 			flush()
 
 		case <-gcTicker.C:
