@@ -2,6 +2,7 @@
 FROM golang:1.23 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -13,6 +14,7 @@ RUN go mod download
 # Copy the go source
 COPY cmd/ cmd/
 COPY internal/ internal/
+COPY VERSION ./
 
 # Build
 # the GOARCH has not a default value to allow the binary be built according to the host where the command
@@ -21,14 +23,22 @@ COPY internal/ internal/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=1 \
     GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -extldflags '-static' -linkmode=external" \
+    go build -trimpath -ldflags="-s -w -extldflags '-static' -linkmode=external -X main.Version=${VERSION}" \
     -o /collector ./cmd/collector
+
+# Build healthcheck binary
+RUN CGO_ENABLED=1 \
+    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w -extldflags '-static' -linkmode=external -X main.Version=${VERSION}" \
+    -o /healthcheck ./cmd/healthcheck
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /
 COPY --from=builder /collector /collector
+COPY --from=builder /healthcheck /healthcheck
+COPY --from=builder /workspace/VERSION /VERSION
 
 # OTLP/HTTP default port
 EXPOSE 4318

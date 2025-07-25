@@ -16,6 +16,9 @@ import (
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/uploader"
 )
 
+// Version is set at build time via ldflags
+var Version = "dev"
+
 func main() {
 	cfg := config.Load()
 
@@ -53,7 +56,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("collector-proxy listening on %s", srv.Addr)
+		log.Printf("collector-proxy v%s listening on %s", Version, srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen error: %v", err)
 		}
