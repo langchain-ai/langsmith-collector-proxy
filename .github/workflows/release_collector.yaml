@@ -3,21 +3,65 @@ name: Publish Collector Docker Images
 on:
   push:
     branches: [main]
+    paths:
+      - 'VERSION'
   workflow_dispatch:
 
 jobs:
-  publish-collector:
+  check-version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version-changed: ${{ steps.check.outputs.changed }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Set up Short Hash
+      - name: Get current version
+        id: version
         run: |
+          VERSION=$(cat VERSION)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION"
+
+      - name: Check if version changed
+        id: check
+        run: |
+          if git diff HEAD~1 HEAD --name-only | grep -q "^VERSION$"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Version file changed"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Version file not changed"
+          fi
+
+      - name: Validate semantic version
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          VERSION=$(cat VERSION)
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: VERSION must follow semantic versioning (x.y.z)"
+            exit 1
+          fi
+          echo "Version $VERSION is valid"
+
+  publish-collector:
+    needs: check-version
+    runs-on: ubuntu-latest
+    if: needs.check-version.outputs.version-changed == 'true' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up environment variables
+        run: |
+          echo "VERSION=${{ needs.check-version.outputs.version }}" >> $GITHUB_ENV
           echo "GIT_SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.LANGCHAIN_DOCKERHUB_USERNAME }}
           password: ${{ secrets.LANGCHAIN_DOCKERHUB_PASSWORD }}
@@ -25,12 +69,32 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Publish collector image
+      - name: Build and push collector image
         uses: docker/build-push-action@v5
         with:
           push: true
           platforms: linux/amd64,linux/arm64
           file: Dockerfile
+          build-args: |
+            VERSION=${{ env.VERSION }}
           tags: |
             docker.io/langchain/langsmith-collector-proxy:latest
+            docker.io/langchain/langsmith-collector-proxy:v${{ env.VERSION }}
             docker.io/langchain/langsmith-collector-proxy:${{ env.GIT_SHORT_SHA }}
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.VERSION }}
+          release_name: Release v${{ env.VERSION }}
+          body: |
+            ## Changes in v${{ env.VERSION }}
+
+            Docker images published:
+            - `docker.io/langchain/langsmith-collector-proxy:v${{ env.VERSION }}`
+            - `docker.io/langchain/langsmith-collector-proxy:latest`
+            - `docker.io/langchain/langsmith-collector-proxy:${{ env.GIT_SHORT_SHA }}`
+          draft: false
+          prerelease: false

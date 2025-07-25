@@ -10,7 +10,8 @@ help: ## Show this help message
 ##@ Build
 build: ## Build the collector binary
 	@echo "Building collector..."
-	go build -o bin/collector ./cmd/collector
+	@VERSION=$$(cat VERSION 2>/dev/null || echo "dev"); \
+	go build -ldflags="-X main.Version=$$VERSION" -o bin/collector ./cmd/collector
 
 ##@ Testing
 test: ## Run all tests
@@ -74,6 +75,9 @@ dev-setup: deps ## Set up development environment
 run: build ## Build and run the collector
 	@echo "Running collector..."
 	./bin/collector
+
+version: ## Show current version
+	@cat VERSION 2>/dev/null || echo "dev"
 
 ##@ CI/CD
 ci-test: deps test vet ## Run CI tests (deps, test, vet)
