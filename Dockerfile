@@ -26,18 +26,11 @@ RUN CGO_ENABLED=1 \
     go build -trimpath -ldflags="-s -w -extldflags '-static' -linkmode=external -X main.Version=${VERSION}" \
     -o /collector ./cmd/collector
 
-# Build healthcheck binary
-RUN CGO_ENABLED=1 \
-    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -extldflags '-static' -linkmode=external -X main.Version=${VERSION}" \
-    -o /healthcheck ./cmd/healthcheck
-
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /
 COPY --from=builder /collector /collector
-COPY --from=builder /healthcheck /healthcheck
 COPY --from=builder /workspace/VERSION /VERSION
 
 # OTLP/HTTP default port
