@@ -49,7 +49,7 @@ func TestGRPCServer(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Create client connection
-	conn, err := grpc.Dial(server.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(server.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to connect to gRPC server: %v", err)
 	}
