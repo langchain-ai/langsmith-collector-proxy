@@ -278,6 +278,20 @@ func (a *Aggregator) worker(ctx context.Context, ch <-chan *model.Run) {
 				}
 			}
 
+			// If dotted order is already set, pass through directly
+			if r.DottedOrder != nil && *r.DottedOrder != "" {
+				// Still track this run for potential children
+				if r.ID != nil {
+					dottedByRunID[*r.ID] = entry{dotted: *r.DottedOrder, ts: time.Now()}
+				}
+				add(r)
+				// Check if this run can resolve any waiting children
+				if r.ID != nil {
+					cascade(*r.ID, *r.DottedOrder)
+				}
+				continue
+			}
+
 			switch {
 			case r.ParentRunID == nil || *r.ParentRunID == "":
 				if r.RootSpanID != nil {
