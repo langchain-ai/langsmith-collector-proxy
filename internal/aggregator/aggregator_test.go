@@ -410,6 +410,212 @@ func TestMultipleTracesInterleaved(t *testing.T) {
 	}
 }
 
+func TestPresetDottedOrder(t *testing.T) {
+	cfg := Config{
+		BatchSize:     1, // Process immediately
+		FlushInterval: 10 * time.Second,
+		FilterConfig:  FilterConfig{FilterNonGenAI: false},
+	}
+
+	ch := make(chan *model.Run, 10)
+	testUploader := NewTestUploader()
+	agg := New(testUploader, cfg, ch)
+	agg.Start()
+	defer agg.Stop()
+
+	// Send a run with pre-set dotted order
+	runWithDottedOrder := &model.Run{
+		ID:          util.StringPtr("run1"),
+		TraceID:     util.StringPtr("trace1"),
+		Name:        util.StringPtr("preset_dotted_span"),
+		DottedOrder: util.StringPtr("20241201T120000000000_abc123.20241201T120001000000_def456"),
+	}
+
+	ch <- runWithDottedOrder
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have sent one batch immediately
+	if testUploader.GetBatchCount() != 1 {
+		t.Fatalf("Expected 1 batch, got %d", testUploader.GetBatchCount())
+	}
+
+	// Now send a child run that should be able to use the parent's dotted order
+	childRun := &model.Run{
+		ID:          util.StringPtr("child1"),
+		TraceID:     util.StringPtr("trace1"),
+		ParentRunID: util.StringPtr("run1"),
+		Name:        util.StringPtr("child_span"),
+	}
+
+	ch <- childRun
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have sent another batch for the child
+	if testUploader.GetBatchCount() != 2 {
+		t.Fatalf("Expected 2 batches, got %d", testUploader.GetBatchCount())
+	}
+}
+
+func TestPresetDottedOrderWithWaitingChildren(t *testing.T) {
+	cfg := Config{
+		BatchSize:     1, // Process immediately
+		FlushInterval: 10 * time.Second,
+		FilterConfig:  FilterConfig{FilterNonGenAI: false},
+	}
+
+	ch := make(chan *model.Run, 10)
+	testUploader := NewTestUploader()
+	agg := New(testUploader, cfg, ch)
+	agg.Start()
+	defer agg.Stop()
+
+	// Send a child run first (before parent)
+	childRun := &model.Run{
+		ID:          util.StringPtr("child1"),
+		TraceID:     util.StringPtr("trace1"),
+		ParentRunID: util.StringPtr("parent1"),
+		Name:        util.StringPtr("child_span"),
+	}
+
+	ch <- childRun
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not have sent any batches yet (child is waiting)
+	if testUploader.GetBatchCount() != 0 {
+		t.Fatalf("Expected 0 batches, got %d", testUploader.GetBatchCount())
+	}
+
+	// Now send parent with pre-set dotted order
+	parentWithDottedOrder := &model.Run{
+		ID:          util.StringPtr("parent1"),
+		TraceID:     util.StringPtr("trace1"),
+		Name:        util.StringPtr("parent_span"),
+		DottedOrder: util.StringPtr("20241201T120000000000_abc123"),
+	}
+
+	ch <- parentWithDottedOrder
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have sent 2 batches: parent + child (cascaded)
+	if testUploader.GetBatchCount() != 2 {
+		t.Fatalf("Expected 2 batches, got %d", testUploader.GetBatchCount())
+	}
+}
+
+func TestPresetDottedOrderValidation(t *testing.T) {
+	cfg := Config{
+		BatchSize:     1, // Process immediately
+		FlushInterval: 10 * time.Second,
+		FilterConfig:  FilterConfig{FilterNonGenAI: false},
+	}
+
+	ch := make(chan *model.Run, 10)
+	testUploader := NewTestUploader()
+	agg := New(testUploader, cfg, ch)
+	agg.Start()
+	defer agg.Stop()
+
+	// Test realistic LangSmith-style dotted orders where run_id matches last part
+	rootRunID := "718d011a-b7ce-4385-bd5b-f19e61084111"
+	childRunID := "a8c96ac9-8008-4e75-b67a-65db01da0cb3"
+	grandchildRunID := "3d3cf01b-166f-4625-a0d6-9e5e1d077572"
+
+	// Root run with dotted order ending in its own run_id
+	rootRun := &model.Run{
+		ID:          util.StringPtr(rootRunID),
+		TraceID:     util.StringPtr(rootRunID), // Root run ID doubles as trace ID
+		Name:        util.StringPtr("gen_ai.chain"),
+		DottedOrder: util.StringPtr("20250729T120000000000000Z" + rootRunID),
+	}
+
+	// Child run with dotted order ending in its own run_id
+	childRun := &model.Run{
+		ID:          util.StringPtr(childRunID),
+		TraceID:     util.StringPtr(rootRunID),
+		ParentRunID: util.StringPtr(rootRunID),
+		Name:        util.StringPtr("llm.completion"),
+		DottedOrder: util.StringPtr("20250729T120000000000000Z" + rootRunID + ".20250729T120000100000000Z" + childRunID),
+	}
+
+	// Grandchild run with dotted order ending in its own run_id
+	grandchildRun := &model.Run{
+		ID:          util.StringPtr(grandchildRunID),
+		TraceID:     util.StringPtr(rootRunID),
+		ParentRunID: util.StringPtr(childRunID),
+		Name:        util.StringPtr("gen_ai.tool"),
+		DottedOrder: util.StringPtr("20250729T120000000000000Z" + rootRunID + ".20250729T120000100000000Z" + childRunID + ".20250729T120000200000000Z" + grandchildRunID),
+	}
+
+	// Send runs in order
+	ch <- rootRun
+	time.Sleep(50 * time.Millisecond)
+	ch <- childRun
+	time.Sleep(50 * time.Millisecond)
+	ch <- grandchildRun
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have sent 3 batches (one for each run)
+	if testUploader.GetBatchCount() != 3 {
+		t.Fatalf("Expected 3 batches, got %d", testUploader.GetBatchCount())
+	}
+}
+
+func TestPresetDottedOrderMixedWithGenerated(t *testing.T) {
+	cfg := Config{
+		BatchSize:     1, // Process immediately
+		FlushInterval: 10 * time.Second,
+		FilterConfig:  FilterConfig{FilterNonGenAI: false},
+	}
+
+	ch := make(chan *model.Run, 10)
+	testUploader := NewTestUploader()
+	agg := New(testUploader, cfg, ch)
+	agg.Start()
+	defer agg.Stop()
+
+	// Send a run with preset dotted order
+	presetRun := &model.Run{
+		ID:          util.StringPtr("preset-run-id"),
+		TraceID:     util.StringPtr("trace1"),
+		Name:        util.StringPtr("preset_run"),
+		DottedOrder: util.StringPtr("20250729T120000000000000Zpreset-run-id"),
+	}
+
+	// Send a run without dotted order (should be generated)
+	generatedRun := &model.Run{
+		ID:      util.StringPtr("generated-run-id"),
+		TraceID: util.StringPtr("trace2"),
+		Name:    util.StringPtr("generated_run"),
+		// No DottedOrder - should be generated by aggregator
+	}
+
+	// Send a child of the preset run (should wait and then be processed)
+	childOfPreset := &model.Run{
+		ID:          util.StringPtr("child-of-preset"),
+		TraceID:     util.StringPtr("trace1"),
+		ParentRunID: util.StringPtr("preset-run-id"),
+		Name:        util.StringPtr("child_run"),
+		// No DottedOrder - should be generated based on parent
+	}
+
+	// Send preset run first
+	ch <- presetRun
+	time.Sleep(50 * time.Millisecond)
+
+	// Send child (should be processed immediately since parent exists)
+	ch <- childOfPreset
+	time.Sleep(50 * time.Millisecond)
+
+	// Send generated run
+	ch <- generatedRun
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have sent 3 batches
+	if testUploader.GetBatchCount() != 3 {
+		t.Fatalf("Expected 3 batches, got %d", testUploader.GetBatchCount())
+	}
+}
+
 func TestComplexFilteringScenario(t *testing.T) {
 	cfg := Config{
 		BatchSize:     1,

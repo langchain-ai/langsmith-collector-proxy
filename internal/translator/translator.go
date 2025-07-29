@@ -95,10 +95,14 @@ func (t *Translator) Translate(req *collectortracepb.ExportTraceServiceRequest) 
 				if len(span.ParentSpanId) == 0 || isLangSmithRoot {
 					if spanUUID, err := idToUUID(span.SpanId); err == nil {
 						run.RootSpanID = util.StringPtr(spanUUID.String())
-					}
-					if traceUUID, err := idToUUID(span.TraceId); err == nil {
-						traceStr := traceUUID.String()
-						run.ID = &traceStr
+						// Only set run.ID to trace ID if it's still the original span ID
+						// (meaning it wasn't overridden by LangSmith attributes)
+						if run.ID != nil && *run.ID == spanUUID.String() {
+							if traceUUID, err := idToUUID(span.TraceId); err == nil {
+								traceStr := traceUUID.String()
+								run.ID = &traceStr
+							}
+						}
 					}
 				} else if run.ParentRunID != nil {
 					t.mu.RLock()
