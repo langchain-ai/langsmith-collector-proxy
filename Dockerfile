@@ -35,6 +35,8 @@ COPY --from=builder /workspace/VERSION /VERSION
 
 # OTLP/HTTP default port
 EXPOSE 4318
+# OTLP/gRPC default port
+EXPOSE 4317
 
 USER nonroot:nonroot
 ENTRYPOINT ["/collector"]
