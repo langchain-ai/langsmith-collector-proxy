@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/aggregator"
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/config"
+	grpcserver "github.com/langchain-ai/langsmith-collector-proxy/internal/grpc"
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/model"
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/server"
 	"github.com/langchain-ai/langsmith-collector-proxy/internal/uploader"
@@ -47,7 +49,8 @@ func main() {
 	agg.Start()
 	defer agg.Stop()
 
-	srv := &http.Server{
+	// HTTP Server
+	httpSrv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      trSrv,
 		ReadTimeout:  30 * time.Second,
@@ -55,12 +58,40 @@ func main() {
 		IdleTimeout:  75 * time.Second,
 	}
 
+	// gRPC Server (if enabled)
+	var grpcSrv *grpcserver.Server
+	var err error
+	if cfg.GRPCEnabled {
+		grpcSrv, err = grpcserver.NewServer(cfg, ch)
+		if err != nil {
+			log.Fatalf("failed to create gRPC server: %v", err)
+		}
+	}
+
+	// Start servers
+	var wg sync.WaitGroup
+
+	// Start HTTP server
+	wg.Add(1)
 	go func() {
-		log.Printf("collector-proxy v%s listening on %s", Version, srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen error: %v", err)
+		defer wg.Done()
+		log.Printf("collector-proxy v%s HTTP server listening on %s", Version, httpSrv.Addr)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
+
+	// Start gRPC server if enabled
+	if cfg.GRPCEnabled && grpcSrv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Printf("collector-proxy v%s gRPC server listening on %s", Version, grpcSrv.Addr())
+			if err := grpcSrv.Start(); err != nil {
+				log.Fatalf("gRPC server error: %v", err)
+			}
+		}()
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -71,8 +102,14 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	// Shutdown HTTP server
+	if err := httpSrv.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server shutdown failed: %v", err)
+	}
+
+	// Shutdown gRPC server
+	if cfg.GRPCEnabled && grpcSrv != nil {
+		grpcSrv.Stop()
 	}
 
 	close(ch)

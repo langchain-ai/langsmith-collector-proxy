@@ -8,8 +8,15 @@ import (
 )
 
 type Config struct {
-	Port               string
-	MaxBodyBytes       int64
+	// HTTP Server Config
+	Port         string
+	MaxBodyBytes int64
+	// gRPC Server Config
+	GRPCPort           string
+	GRPCMaxRecvMsgSize int
+	GRPCMaxSendMsgSize int
+	GRPCEnabled        bool
+	// LangSmith Config
 	LangsmithHost      string
 	DefaultAPIKey      string
 	DefaultProject     string
@@ -56,11 +63,25 @@ func envDuration(key string, def time.Duration) time.Duration {
 	return def
 }
 
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
 func Load() Config {
 	return Config{
 		// HTTP Server Config
 		Port:         env("HTTP_PORT", "4318"),
 		MaxBodyBytes: envInt64("MAX_BODY_BYTES", 209715200), // 200 MB
+		// gRPC Server Config
+		GRPCPort:           env("GRPC_PORT", "4317"),                      // Standard OTLP gRPC port
+		GRPCMaxRecvMsgSize: envInt("GRPC_MAX_RECV_MSG_SIZE", 4*1024*1024), // 4MB
+		GRPCMaxSendMsgSize: envInt("GRPC_MAX_SEND_MSG_SIZE", 4*1024*1024), // 4MB
+		GRPCEnabled:        envBool("GRPC_ENABLED", true),
 		// LangSmith Config
 		LangsmithHost:  env("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
 		DefaultAPIKey:  env("LANGSMITH_API_KEY", ""),
